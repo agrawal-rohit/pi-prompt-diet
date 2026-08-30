@@ -1,7 +1,7 @@
 # 🥗 pi-prompt-diet
 
 > A configuration-driven, high-efficiency System Prompt optimizer
-> for [Pi Coding Agent](https://github.com/earendil-works/pi) that cuts baseline token overhead by **over 51%** (~2,557
+> for [Pi Coding Agent](https://github.com/earendil-works/pi) that cuts baseline token overhead by **over 50.4%** (~2,525
 > Tokens/turn) out-of-the-box while keeping **100% of all tool calling capabilities intact**.
 
 [English](#english) | [中文说明](#中文说明)
@@ -42,10 +42,10 @@ A standard setup with 8–10 packages often results in:
 
 | Metric                     | Before Diet              | With `pi-prompt-diet` (Default: `slim` + `compress`)   | Reduction              |
 |----------------------------|--------------------------|--------------------------------------------------------|------------------------|
-| **System Prompt Size**     | 20,030 chars (~5,008 T)  | **9,805 chars (~2,451 T)**                             | 🔻 **-51.1%**          |
+| **System Prompt Size**     | 20,030 chars (~5,008 T)  | **9,930 chars (~2,483 T)**                             | 🔻 **-50.4%**          |
 | **Guidelines Block**       | 9,265 chars (52 bullets) | **537 chars (7 core heuristics)**                      | 🔻 **-94.2%**          |
-| **Skills Block**           | 5,755 chars (14 skills)  | **4,258 chars (14 skills compressed to 1st sentence)** | 🔻 **-26.0%**          |
-| **Token Savings Per Turn** | -                        | **~2,557 Tokens / turn**                               | 💰 **Instant Savings** |
+| **Skills Block**           | 5,755 chars (14 skills)  | **4,383 chars (14 skills, natural sentence-first)**    | 🔻 **-23.8%**          |
+| **Token Savings Per Turn** | -                        | **~2,525 Tokens / turn**                               | 💰 **Instant Savings** |
 | **Tool Functionality**     | 33 tools active          | **33 tools active**                                    | ✅ **100% Preserved**  |
 
 <details>
@@ -93,19 +93,20 @@ A standard setup with 8–10 packages often results in:
   },
   "skills": {
     "mode": "compress",
-    "maxDescriptionLength": 120
+    "maxDescriptionLength": 200
   },
   "packages": []
 }
 ```
 
-#### Advanced Package Overrides (`packages` Array)
+#### Advanced Granular Overrides (`packages` Array)
 
-When you need granular control over specific third-party packages, populate the `packages` array:
+`pi-prompt-diet` supports multiple granular override formats in the `packages` array:
 
 ```json
 {
   "packages": [
+    // 1. Precise per-file/skill mode mapping:
     {
       "source": "npm:pi-subagents",
       "guidelines": { "mode": "slim" },
@@ -113,6 +114,19 @@ When you need granular control over specific third-party packages, populate the 
         "skills/council-mode": "full",   // 👈 Keep full multi-paragraph description
         "skills/pi-subagents": "slim"    // 👈 Compress to concise primary sentence
       }
+    },
+    // 2. Include/Exclude rule list (matching settings.json +/- syntax):
+    {
+      "source": "npm:pi-lens",
+      "skills": [
+        "-skills/pi-lens-write-tree-sitter-rule", // 👈 Exclude this rule skill from prompt
+        "+skills/pi-lens-lsp-navigation"          // 👈 Keep navigation skill
+      ]
+    },
+    // 3. Complete package-level stripping:
+    {
+      "source": "npm:@juicesharp/rpiv-ask-user-question",
+      "guidelines": { "mode": "strip" }
     }
   ]
 }
@@ -120,14 +134,14 @@ When you need granular control over specific third-party packages, populate the 
 
 #### Configuration Reference
 
-| Level                | Key                           | Options / Type                                                                                              | Description                                                                       |
-|----------------------|-------------------------------|-------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| **Global**           | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                           | Default guideline treatment across all packages.                                  |
-| **Global**           | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                       | Default skill description treatment.                                              |
-| **Global**           | `skills.maxDescriptionLength` | `number` (default: `120`)                                                                                   | Max character limit when compressing skill descriptions.                          |
-| **Package Override** | `packages[].source`           | `string`                                                                                                    | Package name (e.g. `"npm:pi-subagents"` or `"pi-gpt"`).                           |
-| **Package Override** | `packages[].guidelines`       | `"slim"` \| `"strip"` \| `"full"` \| `{"mode": "..."}`                                                      | Package-specific guidelines override.                                             |
-| **Package Override** | `packages[].skills`           | `"compress"` \| `"strip"` \| `"full"` \| `{"mode": "..."}` \| `Record<string, "full" \| "slim" \| "strip">` | Package-specific skill override (supports mode object or exact per-file mapping). |
+| Level                | Key                           | Options / Type                                                                                                            | Description                                                                                     |
+|----------------------|-------------------------------|---------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| **Global**           | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                                         | Default guideline treatment across all packages.                                                |
+| **Global**           | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                                     | Default skill description treatment (natural sentence-first algorithm).                         |
+| **Global**           | `skills.maxDescriptionLength` | `number` (default: `200`)                                                                                                 | Max character limit when compressing skill descriptions.                                        |
+| **Package Override** | `packages[].source`           | `string`                                                                                                                  | Package name (e.g. `"npm:pi-subagents"` or `"pi-gpt"`).                                         |
+| **Package Override** | `packages[].guidelines`       | `"slim"` \| `"strip"` \| `"full"` \| `{"mode": "..."}`                                                                    | Package-specific guidelines override.                                                           |
+| **Package Override** | `packages[].skills`           | `"compress"` \| `"strip"` \| `"full"` \| `{"mode": "..."}` \| `string[]` \| `Record<string, "full" \| "slim" \| "strip">` | Package-specific skill override (supports mode object, +/- rule arrays, or exact file mapping). |
 
 </details>
 
@@ -182,10 +196,10 @@ pi install npm:pi-prompt-diet
 
 | 模块 / 指标                           | 优化前基线             | 启用 `pi-prompt-diet` (默认 `slim` + `compress`) | 缩减幅度             |
 |---------------------------------------|------------------------|--------------------------------------------------|----------------------|
-| **System Prompt 实际体积**            | 20,030 字符 (~5,008 T) | **9,805 字符 (~2,451 T)**                        | 🔻 **-51.1%**        |
+| **System Prompt 实际体积**            | 20,030 字符 (~5,008 T) | **9,930 字符 (~2,483 T)**                        | 🔻 **-50.4%**        |
 | **Guidelines 规则区**                 | 9,265 字符 (52 条)     | **537 字符 (7 条核心准则)**                      | 🔻 **-94.2%**        |
-| **技能描述区 (`<available_skills>`)** | 5,755 字符 (14 个技能) | **4,258 字符 (14 个技能全部浓缩首句)**           | 🔻 **-26.0%**        |
-| **单轮节省 Token**                    | -                      | **~2,557 Tokens / 轮**                           | 💰 **极致省流**      |
+| **技能描述区 (`<available_skills>`)** | 5,755 字符 (14 个技能) | **4,383 字符 (14 个技能自然完整首句浓缩)**       | 🔻 **-23.8%**        |
+| **单轮节省 Token**                    | -                      | **~2,525 Tokens / 轮**                           | 💰 **极致省流**      |
 | **工具与技能可用性**                  | 33 个工具全激活        | **33 个工具全激活**                              | ✅ **100% 完整保留** |
 
 <details>
@@ -224,26 +238,40 @@ pi install npm:pi-prompt-diet
   },
   "skills": {
     "mode": "compress",
-    "maxDescriptionLength": 120
+    "maxDescriptionLength": 200
   },
   "packages": []
 }
 ```
 
-#### 进阶包微调覆盖示例 (`packages` 数组)
+#### 进阶包微调与全场景覆盖示例 (`packages` 数组)
 
-当你需要对特定第三方插件进行精细化微调时，可使用 `packages` 数组：
+`pi-prompt-diet` 在 `packages` 数组中支持多种灵活的细粒度覆盖语法：
 
 ```json
 {
   "packages": [
+    // 1. 精确到单个技能文件的模式映射：
     {
       "source": "npm:pi-subagents",
       "guidelines": { "mode": "slim" },
       "skills": {
-        "skills/council-mode": "full",   // 👈 保留原版多段落完整描述
-        "skills/pi-subagents": "slim"    // 👈 浓缩为单句核心说明
+        "skills/council-mode": "full",   // 👈 该技能保留原版多段落完整描述
+        "skills/pi-subagents": "slim"    // 👈 该技能浓缩为单句核心说明
       }
+    },
+    // 2. 类似 settings.json 的 +/- 路径规则数组：
+    {
+      "source": "npm:pi-lens",
+      "skills": [
+        "-skills/pi-lens-write-tree-sitter-rule", // 👈 排除特定规则编写技能
+        "+skills/pi-lens-lsp-navigation"          // 👈 放行核心导航技能
+      ]
+    },
+    // 3. 彻底剥离特定插件的 Guidelines：
+    {
+      "source": "npm:@juicesharp/rpiv-ask-user-question",
+      "guidelines": { "mode": "strip" }
     }
   ]
 }
@@ -251,14 +279,14 @@ pi install npm:pi-prompt-diet
 
 #### 配置层级与参数说明
 
-| 配置层级     | 参数项                        | 可选值                                                                                                      | 说明                                                                         |
-|--------------|-------------------------------|-------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------|
-| **全局默认** | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                           | 全局通用的 Guidelines 处理策略（默认 `"slim"`）。                            |
-| **全局默认** | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                       | 全局通用的技能描述处理策略（默认 `"compress"` 浓缩首句）。                   |
-| **全局默认** | `skills.maxDescriptionLength` | `number` (默认 `120`)                                                                                       | 浓缩 Skill 描述时的最大字符上限。                                            |
-| **包级覆盖** | `packages[].source`           | `string`                                                                                                    | 目标插件包名（如 `"npm:pi-subagents"` 或 `"pi-gpt"`）。                      |
-| **包级覆盖** | `packages[].guidelines`       | `"slim"` \| `"strip"` \| `"full"` \| `{"mode": "..."}`                                                      | 针对该特定插件的 Guidelines 处理策略覆盖。                                   |
-| **包级覆盖** | `packages[].skills`           | `"compress"` \| `"strip"` \| `"full"` \| `{"mode": "..."}` \| `Record<string, "full" \| "slim" \| "strip">` | 针对该特定插件的技能处理覆盖（支持模式对象，或精准到具体文件的策略映射表）。 |
+| 配置层级     | 参数项                        | 可选值                                                                                                                    | 说明                                                                      |
+|--------------|-------------------------------|---------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------|
+| **全局默认** | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                                         | 全局通用的 Guidelines 处理策略（默认 `"slim"`）。                         |
+| **全局默认** | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                                     | 全局通用的技能描述处理策略（默认自然首句优先智能浓缩）。                  |
+| **全局默认** | `skills.maxDescriptionLength` | `number` (默认 `200`)                                                                                                     | 浓缩 Skill 描述时的最大字符上限。                                         |
+| **包级覆盖** | `packages[].source`           | `string`                                                                                                                  | 目标插件包名（如 `"npm:pi-subagents"` 或 `"pi-gpt"`）。                   |
+| **包级覆盖** | `packages[].guidelines`       | `"slim"` \| `"strip"` \| `"full"` \| `{"mode": "..."}`                                                                    | 针对该特定插件的 Guidelines 处理策略覆盖。                                |
+| **包级覆盖** | `packages[].skills`           | `"compress"` \| `"strip"` \| `"full"` \| `{"mode": "..."}` \| `string[]` \| `Record<string, "full" \| "slim" \| "strip">` | 针对该特定插件的技能处理覆盖（支持模式对象、+/-规则数组或单文件映射表）。 |
 
 </details>
 
