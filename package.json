@@ -1,0 +1,40 @@
+{
+  "name": "pi-prompt-diet",
+  "version": "1.2.1",
+  "description": "A high-efficiency System Prompt optimizer for Pi Coding Agent that reduces baseline token overhead by 60%+ while keeping all tools fully functional.",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "author": "XRSec",
+  "homepage": "https://github.com/XRSec/pi-prompt-diet#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XRSec/pi-prompt-diet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/XRSec/pi-prompt-diet/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "prompt-optimizer",
+    "token-reduction",
+    "context-window",
+    "llm"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "ARCHITECTURE.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
