@@ -53,7 +53,7 @@ const DEFAULT_CONFIG: PromptDietConfig = {
 	},
 	skills: {
 		mode: "compress",
-		maxDescriptionLength: 120,
+		maxDescriptionLength: 200,
 	},
 	packages: [],
 };
@@ -96,6 +96,27 @@ function loadConfig(cwd: string): PromptDietConfig {
 		}
 	}
 	return config;
+}
+
+function formatSkillDescription(rawDesc: string, maxLen: number): string {
+	const cleaned = rawDesc.trim().replace(/\n\s*/g, " ");
+	// 1. 优先提取完整首句（支持中英文标点）
+	const periodIdx = cleaned.search(/[.!?。！？](\s|$)/);
+	let sentence = periodIdx !== -1 ? cleaned.slice(0, periodIdx + 1) : cleaned.split("\n")[0];
+
+	// 2. 如果首句在 maxLen 内，直接返回完整首句
+	if (sentence.length <= maxLen) {
+		return sentence.trim();
+	}
+
+	// 3. 如果首句超长，执行智能单词/词边界截断，绝不在单词中间切开
+	let slice = sentence.slice(0, maxLen - 3);
+	// 如果是西文，寻找最后一个空格避免截断单词
+	const lastSpace = slice.lastIndexOf(" ");
+	if (lastSpace > maxLen * 0.7) {
+		slice = slice.slice(0, lastSpace);
+	}
+	return `${slice.trim()}...`;
 }
 
 function matchSkillRule(skillPath: string, skillName: string, rules: string[]): "include" | "exclude" | "none" {
@@ -245,10 +266,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 					let desc = (s.description || "").trim();
 					if (effectiveMode === "compress" || effectiveMode === "slim") {
 						const maxLen = itemMaxLen ?? override?.maxDescriptionLength ?? globalMaxLen;
-						desc = desc.split("\n")[0];
-						if (desc.length > maxLen) {
-							desc = `${desc.slice(0, maxLen - 3)}...`;
-						}
+						desc = formatSkillDescription(desc, maxLen);
 					}
 					// full 模式则原汁原味保留完整 desc
 
