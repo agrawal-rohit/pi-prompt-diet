@@ -1,8 +1,6 @@
 # 🥗 pi-prompt-diet
 
-> A configuration-driven, high-efficiency System Prompt optimizer
-> for [Pi Coding Agent](https://github.com/earendil-works/pi) that cuts baseline token overhead by **over 50.4%** (~2,525
-> Tokens/turn) out-of-the-box while keeping **100% of all tool calling capabilities intact**.
+> An adaptive System Prompt and capability router for [Pi Coding Agent](https://github.com/earendil-works/pi) that starts with a minimal capability set, expands it as session needs evolve, and progressively discloses tool schemas and Skill guidance from compact indexes to full content.
 
 [English](#english) | [中文说明](#中文说明)
 
@@ -24,23 +22,37 @@ A standard setup with 8–10 packages often results in:
 - Over **5,000 baseline Tokens** consumed before you even type a prompt;
 - Severe context window dilution and unnecessary API billing.
 
-### 💡 The Solution: Hierarchical Configuration Engine
+### 💡 The Solution: Adaptive Capability Routing
 
-`pi-prompt-diet` follows the exact design philosophy of Pi's native `settings.json`:
+`pi-prompt-diet` combines semantic routing with a monotonic, progressively disclosed capability model:
 
-1. **Global Top-Level Defaults**: Define system-wide fallback treatments (`guidelines.mode`, `skills.mode`).
-2. **Per-Package Granular Overrides (`packages: [...]`)**: Fine-tune specific packages (e.g. keep one package's
-   guidelines as `full`, strip another's skills completely, or compress others).
-3. **Zero Functional Loss**: Modern LLMs (GPT-5, Gemini 2.5, Claude 3.7) rely on tool parameter schemas (`JSON Schema`)
-   for accurate calling. All 30+ tools remain 100% callable.
-4. **True Progressive Disclosure**: All pruned skills stay intact on disk and remain 100% available for the agent to
-   `read` on demand.
+1. **Minimal Initial Route**: The first request and a compact catalog of registered tools and Skills are sent to the router. A successful first route replaces Pi's default broad active set with the smallest sufficient set.
+2. **Incremental Session Expansion**: Later requests are routed against the current active set and continuation context. Newly required capabilities are added; capabilities already active in the session are not removed.
+3. **Always-Available Recovery Path & Budget Guard**: The resident `request_capabilities` meta-tool lets the main model request registered tools or Skills discovered during execution. Turn-level budgets (default max 2 requests/turn, max 8 additions/call) prevent infinite activation loops. Pi exposes newly activated tool definitions on the following model request in the same agent run—without `/reload` or a synthetic “continue” message.
+4. **Progressive Tool Disclosure**: Inactive tools appear only as a compact name-and-purpose index. Once activated, Pi supplies their original, complete parameter schemas. The executable schema is never replaced by an AI summary.
+5. **Constraint-First Tool and Skill Distillation**: An unknown third-party tool keeps its complete author-written guidelines on first use. After a successful real call, a background model either caches `full` when the rules are already dense, or creates a concise guideline capsule that prioritizes negative constraints ("never", "do not") and sequential ordering. Skills are distilled after the main model reads the full `SKILL.md`.
+6. **Content-Addressed Cache with CAS & Distiller Versioning**: Tool decisions live independently under `~/.pi/agent/cache/pi-prompt-diet/tools/`; Skill capsules live under `~/.pi/agent/cache/pi-prompt-diet/skills/`. SHA-256 fingerprints combine source content with `DISTILLER_VERSION` and use Compare-And-Swap checks to prevent stale concurrent overwrites.
+7. **Session Persistence, Commands & Observability**: Capability state is persisted in the Pi session, while `/prompt-diet` command provides instant inspection into active/inactive tools, cache counts, and expansion stats.
+8. **Hierarchical Overrides**: Existing global and per-package `slim` / `strip` / `full` policies remain available and apply after routing.
+
+#### Disclosure Levels
+
+| Level | What the main model receives | Purpose |
+|---|---|---|
+| **Capability index** | Inactive tool/Skill name, type, and one-line purpose | Discover what can be requested without paying for every schema |
+| **Active tool** | Original tool description and complete parameter schema | Make the tool safely callable |
+| **Active Skill** | Original description or distilled capsule plus the `SKILL.md` path | Route to the right workflow guidance |
+| **Full Skill** | Complete `SKILL.md`, read on demand | Apply detailed rules and edge cases |
+
+The core rule is: **the index provides discoverability, the original schema provides executability, and the Skill provides correct usage guidance.**
 
 ---
 
-### 📊 Benchmark & Real-world Savings (Clean Default Baseline)
+### 📊 Historical Benchmark
 
-| Metric                     | Before Diet              | With `pi-prompt-diet` (Default: `slim` + `compress`)   | Reduction              |
+> These measurements document the earlier aggressive `slim` + `compress` baseline. Current adaptive behavior keeps an unknown third-party tool's complete guidelines on first use, then caches either `full` or a safe capsule after evaluation. Re-benchmark before quoting these figures as current defaults.
+
+| Metric                     | Before Diet              | Legacy aggressive baseline                             | Reduction              |
 |----------------------------|--------------------------|--------------------------------------------------------|------------------------|
 | **System Prompt Size**     | 20,030 chars (~5,008 T)  | **9,930 chars (~2,483 T)**                             | 🔻 **-50.4%**          |
 | **Guidelines Block**       | 9,265 chars (52 bullets) | **537 chars (7 core heuristics)**                      | 🔻 **-94.2%**          |
@@ -51,16 +63,14 @@ A standard setup with 8–10 packages often results in:
 <details>
 <summary>🔍 <b>Click to expand granular per-package breakdown & reduction evidence</b></summary>
 
-#### Measured Per-Package Guidelines Breakdown (Empirical Trace)
+#### Current Per-Package Guideline Policy
 
-| Package Name                             | Associated Tool         | Baseline Guidelines Chars | Rules Count | Optimization Applied                            |
-|------------------------------------------|-------------------------|---------------------------|-------------|-------------------------------------------------|
-| `npm:pi-subagents`                       | `subagent`              | **~2,800 chars**          | 12 bullets  | Offloaded advanced syntax to on-demand skill    |
-| `npm:@juicesharp/rpiv-ask-user-question` | `ask_user_question`     | **~1,300 chars**          | 4 bullets   | Deduplicated schema constraints from guidelines |
-| `npm:@juicesharp/rpiv-todo`              | `todo`                  | **~1,100 chars**          | 8 bullets   | Trimmed redundant state-machine prose           |
-| `npm:pi-gpt`                             | `gpt_chat`              | **~1,000 chars**          | 6 bullets   | Relies on skill for code review contracts       |
-| `npm:@ff-labs/pi-fff`                    | `fffind`, `ffgrep`      | **~800 chars**            | 10 bullets  | Consolidated into 2 concise heuristics          |
-| `Pi Core Guidelines`                     | `read`, `edit`, `write` | **~1,200 chars**          | 8 bullets   | Preserved core file safety standards            |
+| Tool source | First successful use | Later uses |
+|-------------|----------------------|------------|
+| Pi built-ins | Follow global `guidelines.mode` | Follow global `guidelines.mode` |
+| Unknown third-party tool | Keep complete author guidelines | Use cached `full` or a safe capsule |
+| Explicit package override | Follow the configured `full` / `slim` / `strip` mode | Continue following the override |
+| `Pi Core Guidelines`                     | `read`, `edit`, `write` | core replacement  | Preserve concise file-safety rules. |
 
 #### Measured Skill Description Breakdown
 
@@ -72,6 +82,22 @@ A standard setup with 8–10 packages often results in:
 | `pi-lens-*` (4 skills) | `npm:pi-lens`                             | **~500 chars** combined               | Offloaded to on-demand `read` |
 
 </details>
+
+---
+
+### 💻 Interactive Commands
+
+You can inspect the capability and cache status anytime inside a Pi session:
+
+```text
+/pi-prompt-diet
+```
+
+This outputs a diagnostic overview:
+- **Active Tools**: Tools currently exposed to the main LLM.
+- **Inactive Registered Tools**: Capabilities parked in the compact catalog.
+- **Skill / Tool Capsules in Cache**: Number of distilled capsules saved to disk.
+- **Session Expansions**: Number of dynamic activations triggered via `request_capabilities`.
 
 ---
 
@@ -95,9 +121,20 @@ A standard setup with 8–10 packages often results in:
     "mode": "compress",
     "maxDescriptionLength": 200
   },
+  "adaptive": {
+    "enabled": true,
+    "maxTools": 16,
+    "maxSkills": 8,
+    "distillSkills": true,
+    "distillToolGuidelines": true
+  },
   "packages": []
 }
 ```
+
+There is no built-in package whitelist. An unrecognized third-party tool is cold-started with its complete author guidelines. After the tool is actually called successfully, the evaluator caches either `full` (already concise or unsafe to shorten) or a concise capsule. Explicit package overrides still take precedence and disable automatic treatment for that package.
+
+The router uses the current session model by default. Set `adaptive.model` to a `provider/model` id to use a cheaper dedicated model. The first successful route may shrink Pi's initial broad tool set; after that, Prompt Diet only adds capabilities. Later `before_agent_start` hooks refresh the registry and run incremental routing when the request or catalog changes. Short continuation prompts such as “continue” reuse the persisted pending-task context when available. If routing or activation fails, Prompt Diet preserves the current capability set instead of shrinking it.
 
 #### Advanced Granular Overrides (`packages` Array)
 
@@ -109,7 +146,7 @@ A standard setup with 8–10 packages often results in:
     // 1. Precise per-file/skill mode mapping:
     {
       "source": "npm:pi-subagents",
-      "guidelines": { "mode": "slim" },
+      "guidelines": { "mode": "full" },
       "skills": {
         "skills/council-mode": "full",   // 👈 Keep full multi-paragraph description
         "skills/pi-subagents": "slim"    // 👈 Compress to concise primary sentence
@@ -138,7 +175,14 @@ A standard setup with 8–10 packages often results in:
 |----------------------|-------------------------------|---------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
 | **Global**           | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                                         | Default guideline treatment across all packages.                                                |
 | **Global**           | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                                     | Default skill description treatment (natural sentence-first algorithm).                         |
-| **Global**           | `skills.maxDescriptionLength` | `number` (default: `200`)                                                                                                 | Max character limit when compressing skill descriptions.                                        |
+| **Global**           | `skills.maxDescriptionLength` | `number` (default: `200`)                                                                                                 | Max character limit when compressing skill descriptions or cached capsules.                     |
+| **Adaptive**         | `adaptive.enabled`            | `boolean` (default: `true`)                                                                                               | Enable minimal initial routing and later incremental capability routing.                          |
+| **Adaptive**         | `adaptive.model`              | `"provider/model"`                                                                                                       | Optional dedicated router/distiller model; defaults to the active session model.                 |
+| **Adaptive**         | `adaptive.alwaysTools`         | `string[]`                                                                                                                | Valid tool names always included in the selected set.                                            |
+| **Adaptive**         | `adaptive.maxTools`            | `number` (default: `16`)                                                                                                  | Maximum new tools returned by one router decision.                                               |
+| **Adaptive**         | `adaptive.maxSkills`           | `number` (default: `8`)                                                                                                   | Maximum new Skills returned by one router decision.                                              |
+| **Adaptive**         | `adaptive.distillSkills`       | `boolean` (default: `true`)                                                                                               | Distill a Skill after its complete `SKILL.md` is first read.                                     |
+| **Adaptive**         | `adaptive.distillToolGuidelines` | `boolean` (default: `true`)                                                                                             | Evaluate third-party guidelines after a successful tool call and cache `full` or a capsule.      |
 | **Package Override** | `packages[].source`           | `string`                                                                                                                  | Package name (e.g. `"npm:pi-subagents"` or `"pi-gpt"`).                                         |
 | **Package Override** | `packages[].guidelines`       | `"slim"` \| `"strip"` \| `"full"` \| `{"mode": "..."}`                                                                    | Package-specific guidelines override.                                                           |
 | **Package Override** | `packages[].skills`           | `"compress"` \| `"strip"` \| `"full"` \| `{"mode": "..."}` \| `string[]` \| `Record<string, "full" \| "slim" \| "strip">` | Package-specific skill override (supports mode object, +/- rule arrays, or exact file mapping). |
@@ -180,21 +224,38 @@ pi install npm:pi-prompt-diet
 - 会话还未开始，就已被吃掉 **5,000+ Baseline Tokens**；
 - 严重稀释大模型的上下文注意力窗口，造成显著的 API 费用浪费。
 
-### 💡 解决方案：分层配置引擎（对齐 settings.json 范式）
+### 💡 解决方案：自适应能力路由
 
-`pi-prompt-diet` 作为 `before_agent_start` 流水线上的轻量中间件，采用与 Pi 官方 `settings.json` 完全一致的分层设计：
+`pi-prompt-diet` 将语义路由与“只扩展、不收缩”的渐进式能力披露模型结合：
 
-1. **顶层全局默认策略**：定义系统级的通用去脂规则（`guidelines.mode`、`skills.mode`）；
-2. **`packages` 数组局部精准微调**：支持针对特定插件单独声明策略（如某个包的 guidelines 保留 `full`，某个包的 skills 完全
-   `strip` 剥离，其余保持全局默认）；
-3. **工具能力 100% 完好保留**：现代模型完全依赖 JSON Schema 即可精准调用工具，30 多个工具随时待命；
-4. **真正的渐进式披露**：被剥离的技能，其物理文件依然完好保留在本地磁盘，需要时 AI 随时通过 `read` 工具按需加载。
+1. **首轮最小路由**：第一条需求与全部已注册工具、Skill 的紧凑目录交给 Router；首轮路由成功后，可将 Pi 默认的宽泛活动工具集合缩减为完成当前任务所需的最小集合。
+2. **会话内增量扩容**：后续需求会结合当前活动能力与 continuation context 再做增量判断；新增需要的能力会被加入，本会话已经激活的能力不会被移除。
+3. **常驻恢复入口与预算保护**：`request_capabilities` 元工具始终活动，并具备单 Turn 预算防护（防刷与单次上限）。主模型在读取文件或工具结果后才发现能力不足时，可按名称申请已注册工具或 Skill；Pi 会在同一 Agent run 的下一次模型请求中暴露新工具，无需 `/reload`，也无需伪造一条“继续”。
+4. **工具由浅至深披露**：未激活工具只以“名称 + 类型 + 一句话用途”的目录形式出现；激活后由 Pi 提供原始、完整的参数 Schema。可执行 Schema 不会被 AI 蒸馏版本替代。
+5. **约束优先的工具与 Skill 蒸馏**：陌生第三方工具首次完整保留作者规则，使用后评估并优先提取负向约束（"never", "do not"）与执行顺序；若规则已精炼则直接缓存为 `full`。Skill 在首次完整读取后自动提炼关键规则胶囊。
+6. **带版本锁与 CAS 的内容寻址缓存**：工具与 Skill 胶囊分别独立保存于 `~/.pi/agent/cache/pi-prompt-diet/tools/` 与 `skills/`；指纹混入 `DISTILLER_VERSION` 并采用 CAS 校验，防止并发竞争写入脏数据。
+7. **会话持久化与 `/prompt-diet` 可观测性**：能力状态持久化到 Pi Session；可随时通过 `/prompt-diet` 命令查看当前活跃工具、未激活目录、胶囊缓存量与会话扩容指标。
+7. **会话持久化与动态发现**：能力状态写入 Pi Session；每次 `before_agent_start` 都刷新工具 Registry，因此其他扩展中途注册的工具也能在后续被发现。
+8. **分层覆盖保持兼容**：原有全局与包级 `slim` / `strip` / `full` 策略继续生效。
+
+#### 能力披露层级
+
+| 层级 | 主模型收到的内容 | 目的 |
+|---|---|---|
+| **能力索引** | 未激活工具/Skill 的名称、类型和一句话用途 | 低成本知道“还能申请什么” |
+| **活动工具** | 工具原始描述和完整参数 Schema | 让模型真正、正确地发起工具调用 |
+| **活动 Skill** | 原始描述或蒸馏胶囊，以及 `SKILL.md` 路径 | 将模型路由到正确的工作流指导 |
+| **完整 Skill** | 按需读取的完整 `SKILL.md` | 执行详细规则、边界条件和复杂流程 |
+
+核心原则是：**目录负责可发现，原始 Schema 负责可执行，Skill 负责正确使用。**
 
 ---
 
-### 📊 实测削减数据与账单对比 (纯净开箱默认配置)
+### 📊 历史基准数据
 
-| 模块 / 指标                           | 优化前基线             | 启用 `pi-prompt-diet` (默认 `slim` + `compress`) | 缩减幅度             |
+> 以下数据记录的是早期激进版 `slim` + `compress` 基线。当前会在陌生第三方工具首次使用时完整保留 Guidelines，之后再缓存 `full` 或安全胶囊；请勿将下表直接作为当前默认配置数据引用。
+
+| 模块 / 指标                           | 优化前基线             | 早期激进版基线                                   | 缩减幅度             |
 |---------------------------------------|------------------------|--------------------------------------------------|----------------------|
 | **System Prompt 实际体积**            | 20,030 字符 (~5,008 T) | **9,930 字符 (~2,483 T)**                        | 🔻 **-50.4%**        |
 | **Guidelines 规则区**                 | 9,265 字符 (52 条)     | **537 字符 (7 条核心准则)**                      | 🔻 **-94.2%**        |
@@ -205,18 +266,32 @@ pi install npm:pi-prompt-diet
 <details>
 <summary>🔍 <b>点击展开：具体各 NPM 插件削减明细与量化证据</b></summary>
 
-#### 按 NPM 包统计的 Guidelines 削减明细
+#### 当前各包 Guidelines 默认策略
 
-| 插件名称 (NPM Package)                   | 对应工具                | 原 Guidelines 字符数 | 条数  | 优化方式与去噪点                               |
-|------------------------------------------|-------------------------|----------------------|-------|------------------------------------------------|
-| `npm:pi-subagents`                       | `subagent`              | **~2,800 字符**      | 12 条 | 复杂 workflowScript / lanes 语法下沉至按需技能 |
-| `npm:@juicesharp/rpiv-ask-user-question` | `ask_user_question`     | **~1,300 字符**      | 4 条  | 剔除与 JSON Schema 重复的 options/preview 描述 |
-| `npm:@juicesharp/rpiv-todo`              | `todo`                  | **~1,100 字符**      | 8 条  | 剔除 4 状态机与 update payload 的大段冗余文本  |
-| `npm:pi-gpt`                             | `gpt_chat`              | **~1,000 字符**      | 6 条  | 代码审查传 diff 契约与重试规则下沉至按需技能   |
-| `npm:@ff-labs/pi-fff`                    | `fffind`, `ffgrep`      | **~800 字符**        | 10 条 | 将 10 条琐碎用例浓缩为 2 条核心搜索启发式      |
-| `Pi Core 内置规则`                       | `read`, `edit`, `write` | **~1,200 字符**      | 8 条  | 完整保留核心文件安全与编辑准则                 |
+| 工具来源 | 第一次成功使用 | 后续使用 |
+|----------|----------------|----------|
+| Pi 内置工具 | 遵循全局 `guidelines.mode` | 遵循全局 `guidelines.mode` |
+| 未知第三方工具 | 完整保留作者 Guidelines | 使用缓存的 `full` 或安全胶囊 |
+| 显式包级 override | 遵循配置的 `full` / `slim` / `strip` | 继续遵循 override |
+| `Pi Core 内置规则`                       | `read`, `edit`, `write` | 核心替换 | 保留精简文件安全规则。 |
 
 </details>
+
+---
+
+### 💻 交互式命令
+
+在 Pi 会话中输入斜杠命令即可实时查看瘦身与缓存状态：
+
+```text
+/pi-prompt-diet
+```
+
+面板将展示：
+- **Active Tools**：当前暴露给大模型的活动工具；
+- **Inactive Registered Tools**：留在紧凑目录待命的未激活工具；
+- **Skill / Tool 胶囊缓存量**：本地已沉淀的蒸馏胶囊总数；
+- **本会话动态扩容数**：模型通过 `request_capabilities` 成功加载的新工具数。
 
 ---
 
@@ -240,9 +315,20 @@ pi install npm:pi-prompt-diet
     "mode": "compress",
     "maxDescriptionLength": 200
   },
+  "adaptive": {
+    "enabled": true,
+    "maxTools": 16,
+    "maxSkills": 8,
+    "distillSkills": true,
+    "distillToolGuidelines": true
+  },
   "packages": []
 }
 ```
+
+不再维护内置插件白名单。陌生第三方工具第一次实际使用时完整保留作者 Guidelines；成功调用后，评估器缓存 `full`（已经精炼或不宜缩短）或安全胶囊。用户显式配置的包级 override 始终优先，并会关闭该包的自动处理。
+
+路由器默认复用当前会话模型，也可通过 `adaptive.model` 指定更便宜的 `provider/model`。首轮成功路由可以缩减 Pi 初始的宽泛工具集合；完成首次接管后，Prompt Diet 只增加能力。后续 `before_agent_start` 会刷新 Registry，并在需求或目录变化时做增量路由；“继续”等短输入在存在已持久化 `pendingTask` 时复用 continuation context。路由或激活失败时保留当前能力集合，不会继续缩减。
 
 #### 进阶包微调与全场景覆盖示例 (`packages` 数组)
 
@@ -254,7 +340,7 @@ pi install npm:pi-prompt-diet
     // 1. 精确到单个技能文件的模式映射：
     {
       "source": "npm:pi-subagents",
-      "guidelines": { "mode": "slim" },
+      "guidelines": { "mode": "full" },
       "skills": {
         "skills/council-mode": "full",   // 👈 该技能保留原版多段落完整描述
         "skills/pi-subagents": "slim"    // 👈 该技能浓缩为单句核心说明
@@ -283,7 +369,14 @@ pi install npm:pi-prompt-diet
 |--------------|-------------------------------|---------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------|
 | **全局默认** | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                                         | 全局通用的 Guidelines 处理策略（默认 `"slim"`）。                         |
 | **全局默认** | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                                     | 全局通用的技能描述处理策略（默认自然首句优先智能浓缩）。                  |
-| **全局默认** | `skills.maxDescriptionLength` | `number` (默认 `200`)                                                                                                     | 浓缩 Skill 描述时的最大字符上限。                                         |
+| **全局默认** | `skills.maxDescriptionLength` | `number` (默认 `200`)                                                                                                     | 浓缩 Skill 描述或缓存胶囊时的最大字符数。                                 |
+| **自适应**   | `adaptive.enabled`            | `boolean`（默认 `true`）                                                                                                  | 启用首轮最小路由与后续增量能力路由。                                      |
+| **自适应**   | `adaptive.model`              | `"provider/model"`                                                                                                       | 可选专用路由/蒸馏模型；默认使用当前会话模型。                             |
+| **自适应**   | `adaptive.alwaysTools`         | `string[]`                                                                                                                | 无论路由结果如何都保留的有效工具名称。                                    |
+| **自适应**   | `adaptive.maxTools`            | `number`（默认 `16`）                                                                                                     | 单次 Router 决策最多返回的新工具数。                                      |
+| **自适应**   | `adaptive.maxSkills`           | `number`（默认 `8`）                                                                                                      | 单次 Router 决策最多返回的新 Skill 数。                                   |
+| **自适应**   | `adaptive.distillSkills`       | `boolean`（默认 `true`）                                                                                                  | 首次读取完整 `SKILL.md` 后生成蒸馏胶囊。                                  |
+| **自适应**   | `adaptive.distillToolGuidelines` | `boolean`（默认 `true`）                                                                                                | 第三方工具成功调用后评估 Guidelines，并缓存 `full` 或胶囊。               |
 | **包级覆盖** | `packages[].source`           | `string`                                                                                                                  | 目标插件包名（如 `"npm:pi-subagents"` 或 `"pi-gpt"`）。                   |
 | **包级覆盖** | `packages[].guidelines`       | `"slim"` \| `"strip"` \| `"full"` \| `{"mode": "..."}`                                                                    | 针对该特定插件的 Guidelines 处理策略覆盖。                                |
 | **包级覆盖** | `packages[].skills`           | `"compress"` \| `"strip"` \| `"full"` \| `{"mode": "..."}` \| `string[]` \| `Record<string, "full" \| "slim" \| "strip">` | 针对该特定插件的技能处理覆盖（支持模式对象、+/-规则数组或单文件映射表）。 |

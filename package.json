@@ -1,7 +1,7 @@
 {
   "name": "pi-prompt-diet",
-  "version": "1.2.2",
-  "description": "A high-efficiency System Prompt optimizer for Pi Coding Agent that reduces baseline token overhead by 60%+ while keeping all tools fully functional.",
+  "version": "3.0.0",
+  "description": "An adaptive capability router for Pi with progressive tool-guideline and Skill distillation.",
   "type": "module",
   "main": "index.ts",
   "license": "MIT",
@@ -25,6 +25,8 @@
   ],
   "files": [
     "index.ts",
+    "adaptive.ts",
+    "test",
     "README.md",
     "ARCHITECTURE.md",
     "LICENSE"
@@ -33,6 +35,9 @@
     "extensions": [
       "index.ts"
     ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

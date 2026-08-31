@@ -28,53 +28,58 @@ Because Pi concatenates all guidelines linearly, the baseline System Prompt quic
 
 ### 2. How `pi-prompt-diet` Works
 
-`pi-prompt-diet` acts as a pure, non-destructive **Prompt Pipeline Middleware** via Pi's `before_agent_start` lifecycle event.
+`pi-prompt-diet` uses Pi's `before_agent_start`, `tool_result`, and `agent_settled` lifecycle events as an adaptive control plane.
 
 ```
                   ┌──────────────────────────────┐
-                  │ User Input / Turn Triggered  │
+                  │ First User Request in Session│
                   └──────────────┬───────────────┘
                                  │
                                  ▼
                   ┌──────────────────────────────┐
-                  │ Pi Base Prompt Construction  │
-                  │ (Full Tools + Guidelines)    │
+                  │ Router LLM                   │
+                  │ Request + capability catalog │
                   └──────────────┬───────────────┘
                                  │
                                  ▼
                  ┌────────────────────────────────┐
                  │ pi-prompt-diet Middleware      │
-                 │ 1. Filter Guidelines (via keep)│
-                 │ 2. Compress Whitelisted Skills │
-                 │ 3. Replace with Core Standard  │
+                 │ 1. Activate selected tools     │
+                 │ 2. Keep selected Skill entries│
+                 │ 3. Apply package policies      │
                  └───────────────┬────────────────┘
                                  │
                                  ▼
                  ┌────────────────────────────────┐
-                 │ Streamlined System Prompt      │
-                 │ (~6,190 chars / ~1,548 Tokens) │
+                 │ Main Agent                     │
+                 │ Reads full SKILL.md on demand  │
                  └───────────────┬────────────────┘
-                                 │
+                                 │ first Skill read
                                  ▼
                  ┌────────────────────────────────┐
-                 │ Sent to LLM (GPT-5/Gemini/etc.)│
+                 │ Distiller LLM → capsule cache  │
                  └────────────────────────────────┘
 ```
 
 #### Key Execution Stages
 
-1. **Schema Preservation**: Tool parameters (`parameters.properties`) and active tool registrations are untouched. The LLM retains 100% precise schema knowledge.
-2. **Hierarchical Configuration Pipeline (matching settings.json)**:
-   - Evaluates global fallback rules for `guidelines` and `skills`.
-   - Checks the `packages` array for granular per-package overrides (e.g. keep one package's guidelines as `full`, strip another package's skills completely).
-   - Injects a crisp 7-bullet core standard alongside any whitelisted rules.
-3. **Skill Description Normalization**:
-   - Prunes all non-whitelisted skills from `<available_skills>`.
-   - Truncates whitelisted descriptions down to the primary sentence (or up to `maxDescriptionLength` characters).
-   - Sanitizes XML entities (`&`, `<`, `>`) to ensure structural validity.
-4. **Zero Disk Modification**:
-   - Never touches physical files under `~/.agents/skills/` or `~/.pi/agent/skills/`.
-   - All compression occurs strictly in ephemeral runtime memory.
+1. **Incremental Capability Route**:
+   - `before_agent_start` refreshes registered capabilities and routes newly required names using the current request plus continuation state.
+   - The first successful route may shrink the initial broad set; later changes are additive. `request_capabilities` provides an always-active recovery path inside the same agent run.
+   - State is persisted in the Pi session, and routing or activation failures never shrink the current set.
+2. **Hierarchical Configuration Pipeline**:
+   - Explicit per-package policies remain authoritative.
+   - Without an override, a third-party tool keeps its complete author-written guidelines on first successful use. Afterward, a cached evaluator decision either keeps `full` or uses a safe capsule.
+   - Package provenance comes from `sourceInfo`, never from guessing prose; there is no built-in package whitelist.
+3. **Progressive Tool and Skill Distillation**:
+   - A selected cold Skill keeps its original description and path.
+   - When the main model first reads that exact `SKILL.md`, `tool_result` records it; after the agent settles, a direct model call extracts the trigger, negative constraints, ordering rules, and the condition for opening the full file.
+   - The next session uses the concise capsule plus the unchanged Skill path.
+4. **Content-addressed Persistence with CAS & Version Lock**:
+   - Tool decisions are stored independently under `~/.pi/agent/cache/pi-prompt-diet/tools/`; Skill capsules use `~/.pi/agent/cache/pi-prompt-diet/skills/`.
+   - Fingerprints combine content/metadata with `DISTILLER_VERSION`.
+   - Compare-And-Swap (CAS) validation ensures concurrent modifications to source files/metadata do not get overwritten with stale distillations.
+   - Original plugin metadata and physical Skill files are never modified.
 
 ---
 
@@ -84,9 +89,9 @@ Because Pi concatenates all guidelines linearly, the baseline System Prompt quic
 
 | Tier | Component | How it is Handled | Token Overhead |
 |---|---|---|---|
-| **Tier 1 (Base Context)** | Tool Schemas & Core Index | Always resident in System Prompt (compressed) | ~1,548 Tokens |
-| **Tier 2 (Core Workflow)** | `SKILL.md` Files | Loaded dynamically via `read` only when task matches | 0 Base Tokens (On-Demand) |
-| **Tier 3 (Deep Reference)** | `references/*.md` | Read recursively by the agent only during complex edge cases | 0 Base Tokens (On-Demand) |
+| **Tier 1 (Base Context)** | Selected tool schemas, core rules, Skill capsules | Resident after one session route | Task-dependent |
+| **Tier 2 (Core Workflow)** | Full `SKILL.md` files | Loaded dynamically via `read` only when the capsule matches | 0 Base Tokens (On-Demand) |
+| **Tier 3 (Deep Reference)** | `references/*.md` | Read recursively only during complex edge cases | 0 Base Tokens (On-Demand) |
 
 ---
 
@@ -103,17 +108,22 @@ Because Pi concatenates all guidelines linearly, the baseline System Prompt quic
 
 ### 2. `pi-prompt-diet` 的中间件处理流水线
 
-`pi-prompt-diet` 通过 Pi 的 `before_agent_start` 扩展生命周期，作为一个非侵入式中间件执行：
+`pi-prompt-diet` 通过 Pi 的 `before_agent_start`、`tool_result` 与 `agent_settled` 生命周期构成自适应控制面：
 
-1. **Schema 绝对保留**：底层 30+ 个工具的函数定义与参数 Schema 100% 完整交付给大模型，确保工具调用毫秒级精准。
-2. **分层式配置处理流水线（完全对齐 settings.json 范式）**：
-   - 首先加载顶层全局默认策略（`guidelines.mode` 与 `skills.mode`）；
-   - 解析 `packages` 数组中针对特定插件的局部微调（支持独立设置 `slim` / `strip` / `full` / `compress`）；
-   - 提取需要保留的完整规则，并注入 7 条高浓度核心执行原则。
-3. **Skill 描述规范化压缩**：
-   - 仅将用户在 `skills.keep` 中显式声明的技能注入 `<available_skills>`；
-   - 提取每个放行 Skill 的首句核心说明（或截取最精华的 120 字符）；
-   - 对 `&`、`<`、`>` 进行 XML 转义保护。
-4. **磁盘零修改保证**：
-   - 绝不修改本地 `~/.agents/skills/` 里的任何文件；
-   - 模型需要时直接使用 `read` 工具读取完整正文。
+1. **增量能力路由**：
+   - 每次 `before_agent_start` 刷新能力目录，结合当前请求和 continuation state 选择新增能力；
+   - 首次成功路由可以缩减初始宽泛集合，后续只增加；常驻 `request_capabilities` 可在同一个 Agent run 内补充工具；
+   - 状态持久化到 Pi Session，路由或激活失败不缩减现有集合。
+2. **分层配置继续生效**：
+   - 用户显式包级策略始终优先；
+   - 无 override 的第三方工具第一次成功使用时完整保留作者 Guidelines，之后采用缓存的 `full` 判断或安全胶囊；
+   - 通过 `sourceInfo` 精确归属，不再维护内置插件白名单。
+3. **渐进式工具与 Skill 蒸馏**：
+   - 入选但尚无缓存的 Skill 保留原始描述与路径；
+   - 主模型第一次读取该 `SKILL.md` 后，`tool_result` 记录路径，`agent_settled` 再调用模型提取触发条件、负向约束（Must Not）、执行顺序（Ordering）与完整读取条件；
+   - 后续会话只注入短胶囊和原始路径，需要细节时主模型仍会读取完整 Skill。
+4. **带 CAS 校验与版本锁的内容寻址持久缓存**：
+   - 工具判断独立写入 `~/.pi/agent/cache/pi-prompt-diet/tools/`，Skill 胶囊写入 `~/.pi/agent/cache/pi-prompt-diet/skills/`；
+   - 指纹混入 `DISTILLER_VERSION`；写入时执行 CAS (Compare-And-Swap) 校验，防止并发写入陈旧数据；
+   - 工具指纹覆盖名称、描述、参数、Guidelines、来源与版本锁；Skill 指纹覆盖文件内容与版本锁，变化后自动回到冷启动；
+   - 原始插件元数据与 Skill 文件始终不被修改。

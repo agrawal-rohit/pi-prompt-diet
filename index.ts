@@ -1,7 +1,24 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
+import {
+	distillSkill,
+	distillToolGuidelines,
+	formatSkillCapsule,
+	formatToolGuidelineCapsule,
+	getValidSkillCapsule,
+	getValidToolGuidelineCapsule,
+	loadSkillCapsuleCache,
+	loadToolGuidelineCapsuleCache,
+	routeCapabilities,
+	saveSkillCapsule,
+	saveSkillCapsuleCache,
+	saveToolGuidelineCapsule,
+	type AdaptiveConfig,
+	type CapabilitySkill,
+	type CapabilityTool,
+} from "./adaptive.ts";
 
 /**
  * 参考 settings.json 的分层策略定义：
@@ -23,6 +40,21 @@ export interface PackageOverrideConfig {
 	maxDescriptionLength?: number;
 }
 
+export interface SessionCapabilityState {
+	version: 1;
+	firstRouteCompleted: boolean;
+	managedActiveTools: string[];
+	managedActiveSkills: string[];
+	lastAppliedTools: string[];
+	observedExternalTools: string[];
+	registeredTools: string[];
+	recentUserRequests: string[];
+	turnRequestCount?: number;
+	totalExpansions?: number;
+	pendingTask?: string;
+	intentSummary?: string;
+}
+
 export interface PromptDietConfig {
 	enabled?: boolean;
 	guidelines?: {
@@ -34,6 +66,77 @@ export interface PromptDietConfig {
 		maxDescriptionLength?: number;
 	};
 	packages?: (string | PackageOverrideConfig)[];
+	adaptive?: AdaptiveConfig;
+}
+
+
+const CAPABILITY_STATE_ENTRY = "pi-prompt-diet-capabilities";
+const REQUEST_CAPABILITIES_TOOL = "request_capabilities";
+const PURE_CONTINUATIONS = new Set(["继续", "继续做", "再试一次", "好的", "可以", "continue", "go on", "try again"]);
+
+function emptyCapabilityState(): SessionCapabilityState {
+	return {
+		version: 1,
+		firstRouteCompleted: false,
+		managedActiveTools: [],
+		managedActiveSkills: [],
+		lastAppliedTools: [],
+		observedExternalTools: [],
+		registeredTools: [],
+		recentUserRequests: [],
+		turnRequestCount: 0,
+		totalExpansions: 0,
+	};
+}
+
+function unique(values: Iterable<string>): string[] {
+	return [...new Set(values)];
+}
+
+function isPureContinuation(prompt: string): boolean {
+	return PURE_CONTINUATIONS.has(prompt.trim().toLowerCase().replace(/[。.!！]$/, ""));
+}
+
+function restoreCapabilityState(ctx: ExtensionContext): SessionCapabilityState {
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index];
+		if (entry.type !== "custom" || entry.customType !== CAPABILITY_STATE_ENTRY) continue;
+		const data = entry.data as Partial<SessionCapabilityState> | undefined;
+		if (data?.version !== 1) break;
+		return {
+			...emptyCapabilityState(),
+			...data,
+			managedActiveTools: unique(data.managedActiveTools ?? []),
+			managedActiveSkills: unique(data.managedActiveSkills ?? []),
+			lastAppliedTools: unique(data.lastAppliedTools ?? []),
+			observedExternalTools: unique(data.observedExternalTools ?? []),
+			registeredTools: unique(data.registeredTools ?? []),
+			recentUserRequests: (data.recentUserRequests ?? []).slice(-4),
+		};
+	}
+	return emptyCapabilityState();
+}
+
+function appendInactiveCapabilityCatalog(
+	prompt: string,
+	allTools: ReturnType<ExtensionAPI["getAllTools"]>,
+	activeTools: Set<string>,
+	skills: CapabilitySkill[],
+	activeSkills: Set<string>,
+): string {
+	const toolLines = allTools
+		.filter((tool) => !activeTools.has(tool.name))
+		.map((tool) => `- tool ${tool.name}: ${shortToolDescription(tool.description)}`);
+	const skillLines = skills
+		.filter((skill) => !activeSkills.has(skill.name))
+		.map((skill) => `- skill ${skill.name}: ${truncateDescription(skill.description, 180)}`);
+	const lines = [...toolLines, ...skillLines];
+	if (lines.length === 0) return prompt;
+	return `${prompt}
+
+Inactive capabilities (use ${REQUEST_CAPABILITIES_TOOL} when the current task needs one):
+${lines.join("\n")}`;
 }
 
 const DEFAULT_CORE_GUIDELINES = [
@@ -56,10 +159,47 @@ const DEFAULT_CONFIG: PromptDietConfig = {
 		maxDescriptionLength: 200,
 	},
 	packages: [],
+	adaptive: {
+		enabled: true,
+		maxTools: 16,
+		maxSkills: 8,
+		distillSkills: true,
+		distillToolGuidelines: true,
+	},
 };
 
 function normalizeName(name: string): string {
-	return name.replace(/^npm:/, "").replace(/^git:/, "").toLowerCase();
+	const lower = name.toLowerCase();
+	if (!lower.startsWith("npm:")) return lower.replace(/^git:/, "");
+
+	const spec = lower.slice("npm:".length);
+	if (!spec.startsWith("@")) return spec.split("@", 1)[0];
+
+	const scopeSeparator = spec.indexOf("/");
+	if (scopeSeparator === -1) return spec;
+	const packageNameEnd = spec.indexOf("@", scopeSeparator + 1);
+	return packageNameEnd === -1 ? spec : spec.slice(0, packageNameEnd);
+}
+
+function writeConfigFile(configPath: string, config: PromptDietConfig): void {
+	const tempPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		writeFileSync(tempPath, JSON.stringify(config, null, 2), "utf8");
+		renameSync(tempPath, configPath);
+	} finally {
+		rmSync(tempPath, { force: true });
+	}
+}
+
+function mergeConfig(base: PromptDietConfig, next: PromptDietConfig): PromptDietConfig {
+	return {
+		...base,
+		...next,
+		guidelines: { ...base.guidelines, ...(next.guidelines || {}) },
+		skills: { ...base.skills, ...(next.skills || {}) },
+		adaptive: { ...base.adaptive, ...(next.adaptive || {}) },
+		packages: next.packages ?? base.packages,
+	};
 }
 
 function loadConfig(cwd: string): PromptDietConfig {
@@ -73,25 +213,26 @@ function loadConfig(cwd: string): PromptDietConfig {
 	if (!existsSync(primaryUserConfigPath) && !existsSync(legacyUserConfigPath)) {
 		try {
 			mkdirSync(userConfigDir, { recursive: true });
-			writeFileSync(primaryUserConfigPath, JSON.stringify(DEFAULT_CONFIG, null, 2), "utf8");
+			writeConfigFile(primaryUserConfigPath, DEFAULT_CONFIG);
 		} catch {}
 	}
 
-	let config: PromptDietConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+	let config: PromptDietConfig = structuredClone(DEFAULT_CONFIG);
 
-	// 2. 按优先级加载配置（优先 pi-prompt-diet.json，兼容 prompt-diet.json）
-	const searchPaths = [legacyUserConfigPath, primaryUserConfigPath, legacyProjectConfigPath, projectConfigPath];
-	for (const p of searchPaths) {
+	// 2. 合并用户配置。
+	for (const p of [legacyUserConfigPath, primaryUserConfigPath]) {
 		if (existsSync(p)) {
 			try {
-				const userCfg = JSON.parse(readFileSync(p, "utf8"));
-				config = {
-					...config,
-					...userCfg,
-					guidelines: { ...config.guidelines, ...(userCfg.guidelines || {}) },
-					skills: { ...config.skills, ...(userCfg.skills || {}) },
-					packages: userCfg.packages ?? config.packages,
-				};
+				config = mergeConfig(config, JSON.parse(readFileSync(p, "utf8")));
+			} catch {}
+		}
+	}
+
+	// 3. 项目配置保持最高优先级。
+	for (const p of [legacyProjectConfigPath, projectConfigPath]) {
+		if (existsSync(p)) {
+			try {
+				config = mergeConfig(config, JSON.parse(readFileSync(p, "utf8")));
 			} catch {}
 		}
 	}
@@ -133,20 +274,389 @@ function matchSkillRule(skillPath: string, skillName: string, rules: string[]): 
 	return "none";
 }
 
+function selectedCoreGuidelines(customCore: string[] | undefined, selectedTools?: Set<string>): string[] {
+	if (customCore) return customCore;
+	if (!selectedTools) return DEFAULT_CORE_GUIDELINES;
+	return DEFAULT_CORE_GUIDELINES.filter((guideline) => {
+		if (guideline.includes("Use read ")) return selectedTools.has("read");
+		if (guideline.includes("Use edit ") || guideline.includes("edits[].oldText") || guideline.includes("multiple separate locations")) {
+			return selectedTools.has("edit");
+		}
+		if (guideline.includes("Use write ")) return selectedTools.has("write");
+		return true;
+	});
+}
+
+function shortToolDescription(description: string): string {
+	const clean = description.trim().replace(/\s+/g, " ");
+	if (clean.length <= 180) return clean;
+	return `${clean.slice(0, 177).trimEnd()}...`;
+}
+
+function truncateDescription(description: string, maxLength: number): string {
+	const clean = description.trim().replace(/\s+/g, " ");
+	if (clean.length <= maxLength) return clean;
+	const slice = clean.slice(0, Math.max(1, maxLength - 3));
+	const lastSpace = slice.lastIndexOf(" ");
+	const boundary = lastSpace > maxLength * 0.7 ? lastSpace : slice.length;
+	return `${slice.slice(0, boundary).trimEnd()}...`;
+}
+
+function rewriteAvailableTools(prompt: string, selectedTools: Set<string>, allTools: ReturnType<ExtensionAPI["getAllTools"]>): string {
+	const start = prompt.indexOf("Available tools:\n");
+	if (start === -1) return prompt;
+	const end = prompt.indexOf("\n\nGuidelines:", start);
+	if (end === -1) return prompt;
+	const lines = allTools
+		.filter((tool) => selectedTools.has(tool.name))
+		.map((tool) => `- ${tool.name}: ${shortToolDescription(tool.description)}`);
+	const section = lines.length > 0 ? `Available tools:\n${lines.join("\n")}` : "";
+	return prompt.slice(0, start) + section + prompt.slice(end);
+}
+
+function normalizeReadPath(path: string, cwd: string): string {
+	return resolve(cwd, path.replace(/^@/, ""));
+}
+
 export default function promptDiet(pi: ExtensionAPI) {
+	let capabilityState = emptyCapabilityState();
+	let skillCache = loadSkillCapsuleCache();
+	let toolGuidelineCache = loadToolGuidelineCapsuleCache();
+	const knownSkills = new Map<string, CapabilitySkill>();
+	const pendingDistillation = new Set<string>();
+	const pendingToolDistillation = new Set<string>();
+
+	const persistCapabilityState = () => {
+		pi.appendEntry(CAPABILITY_STATE_ENTRY, structuredClone(capabilityState));
+	};
+
+	pi.registerTool({
+		name: REQUEST_CAPABILITIES_TOOL,
+		label: "Request Capabilities",
+		description: "Enable registered tools or Skills needed to continue the current task. Names only; schemas and wildcards are not accepted.",
+		promptSnippet: "Enable additional registered tools or Skills when the active capabilities cannot complete the task",
+		parameters: {
+			type: "object",
+			properties: {
+				tools: { type: "array", items: { type: "string" }, maxItems: 16 },
+				skills: { type: "array", items: { type: "string" }, maxItems: 16 },
+				reason: { type: "string", minLength: 1 },
+			},
+			required: ["reason"],
+			additionalProperties: false,
+		} as any,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const config = loadConfig(ctx.cwd).adaptive ?? {};
+			const maxRequestsPerTurn = (config as any).maxRequestsPerTurn ?? 2;
+			const currentTurnRequests = capabilityState.turnRequestCount ?? 0;
+			if (currentTurnRequests >= maxRequestsPerTurn) {
+				return {
+					content: [{
+						type: "text",
+						text: `Capability request budget exceeded: at most ${maxRequestsPerTurn} request_capabilities calls are allowed per turn. Please proceed using currently active capabilities.`,
+					}],
+					details: {
+						status: "failed",
+						addedTools: [],
+						addedSkills: [],
+						unavailable: [],
+						failures: [{
+							capability: (params.tools ?? []).concat(params.skills ?? []).join(","),
+							code: "turn_budget_exceeded",
+							message: `Maximum calls per turn is ${maxRequestsPerTurn}.`,
+						}],
+					},
+				};
+			}
+
+			const allTools = pi.getAllTools();
+			const availableTools = new Set(allTools.map((tool) => tool.name));
+			const availableSkills = new Set([...knownSkills.values()].map((skill) => skill.name));
+			const requestedTools = unique(params.tools ?? []);
+			const requestedSkills = unique(params.skills ?? []);
+			const unavailable: string[] = [];
+			const failures: Array<{ capability: string; code: string; message: string }> = [];
+			const maxAdditions = config.maxAdditionsPerRequest ?? 8;
+			const forbidden = new Set(config.neverAutoActivate ?? []);
+			const explicitOnly = new Set(config.requireExplicitUserIntent ?? []);
+			const recentIntent = capabilityState.recentUserRequests.join(" ").toLowerCase();
+
+			const validate = (name: string, kind: "tool" | "skill", available: Set<string>): boolean => {
+				if (name === "*" || name.includes("*")) {
+					failures.push({ capability: name, code: "wildcard_forbidden", message: "Wildcard capability requests are not allowed." });
+					return false;
+				}
+				if (!available.has(name)) {
+					unavailable.push(name);
+					return false;
+				}
+				if (forbidden.has(name)) {
+					failures.push({ capability: name, code: "policy_denied", message: `${kind} is blocked by Prompt Diet policy.` });
+					return false;
+				}
+				if (explicitOnly.has(name) && !recentIntent.includes(name.toLowerCase())) {
+					failures.push({ capability: name, code: "explicit_intent_required", message: "The user must explicitly request this capability." });
+					return false;
+				}
+				return true;
+			};
+
+			const validTools = requestedTools.filter((name) => validate(name, "tool", availableTools));
+			const validSkills = requestedSkills.filter((name) => validate(name, "skill", availableSkills));
+			const additions = [...validTools.filter((name) => !capabilityState.managedActiveTools.includes(name)), ...validSkills.filter((name) => !capabilityState.managedActiveSkills.includes(name))];
+			if (additions.length > maxAdditions) {
+				return { content: [{ type: "text", text: `Capability request failed: at most ${maxAdditions} additions are allowed per request.` }], details: { status: "failed", addedTools: [], addedSkills: [], unavailable, failures: [...failures, { capability: additions.join(","), code: "too_many_additions", message: `Maximum is ${maxAdditions}.` }] } };
+			}
+
+			const addedTools = validTools.filter((name) => !capabilityState.managedActiveTools.includes(name));
+			const addedSkills = validSkills.filter((name) => !capabilityState.managedActiveSkills.includes(name));
+			const current = pi.getActiveTools();
+			const nextTools = unique([...current, ...addedTools, REQUEST_CAPABILITIES_TOOL]);
+			try {
+				if (addedTools.length > 0) pi.setActiveTools(nextTools);
+			} catch (error) {
+				return { content: [{ type: "text", text: `Capability activation failed: ${error instanceof Error ? error.message : String(error)}` }], details: { status: "failed", addedTools: [], addedSkills: [], unavailable, failures } };
+			}
+			capabilityState.managedActiveTools = unique([...capabilityState.managedActiveTools, ...addedTools, REQUEST_CAPABILITIES_TOOL]);
+			capabilityState.managedActiveSkills = unique([...capabilityState.managedActiveSkills, ...addedSkills]);
+			capabilityState.lastAppliedTools = nextTools;
+			capabilityState.registeredTools = [...availableTools].sort();
+			capabilityState.turnRequestCount = currentTurnRequests + 1;
+			capabilityState.totalExpansions = (capabilityState.totalExpansions ?? 0) + addedTools.length;
+			capabilityState.pendingTask = params.reason;
+			persistCapabilityState();
+			const status = failures.length || unavailable.length ? "partial" : addedTools.length || addedSkills.length ? "activated" : "already_active";
+			return {
+				content: [{ type: "text", text: addedSkills.length > 0 ? `Capabilities ${status}. Added tools: ${addedTools.join(", ") || "none"}; Skills recorded for subsequent agent starts: ${addedSkills.join(", ")}.` : `Capabilities ${status}. Added tools: ${addedTools.join(", ") || "none"}.` }],
+				details: { status, addedTools, addedSkills, unavailable, failures },
+			};
+		},
+	});
+
+	if (typeof (pi as any).registerCommand === "function") {
+		(pi as any).registerCommand("pi-prompt-diet", {
+			description: "Inspect Prompt Diet active capabilities, inactive tools, and distillation cache status",
+			handler: async (_args: string, ctx: ExtensionContext) => {
+				const allTools = pi.getAllTools();
+				const activeTools = pi.getActiveTools();
+				const inactiveTools = allTools.filter((tool) => !activeTools.includes(tool.name));
+				const skillCapsulesCount = Object.keys(skillCache.skills).length;
+				const toolCapsulesCount = Object.keys(toolGuidelineCache.tools).length;
+				const lines = [
+					"=== pi-prompt-diet Status ===",
+					`• Active Tools (${activeTools.length}): ${activeTools.join(", ") || "none"}`,
+					`• Inactive Registered Tools (${inactiveTools.length}): ${inactiveTools.map((t) => t.name).join(", ") || "none"}`,
+					`• Active Skills: ${capabilityState.managedActiveSkills.join(", ") || "none"}`,
+					`• Skill Capsules in Cache: ${skillCapsulesCount}`,
+					`• Tool Guideline Capsules in Cache: ${toolCapsulesCount}`,
+					`• Total Tools Expanded this Session: ${capabilityState.totalExpansions ?? 0}`,
+					"==============================",
+				];
+				const output = lines.join("\n");
+				if ((ctx as any).ui?.notify) {
+					(ctx as any).ui.notify(output);
+				} else {
+					console.log(output);
+				}
+				return output;
+			},
+		});
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		capabilityState = restoreCapabilityState(ctx);
+		const registered = new Set(pi.getAllTools().map((tool) => tool.name));
+		capabilityState.managedActiveTools = capabilityState.managedActiveTools.filter((name) => registered.has(name));
+		capabilityState.lastAppliedTools = capabilityState.lastAppliedTools.filter((name) => registered.has(name));
+		capabilityState.registeredTools = [...registered].sort();
+		if (capabilityState.firstRouteCompleted) {
+			const restored = unique([...capabilityState.managedActiveTools, ...capabilityState.observedExternalTools.filter((name) => registered.has(name)), REQUEST_CAPABILITIES_TOOL]);
+			try {
+				pi.setActiveTools(restored);
+				capabilityState.lastAppliedTools = restored;
+			} catch (error) {
+				console.warn("[pi-prompt-diet] Failed to restore active tools:", error);
+			}
+		}
+		skillCache = loadSkillCapsuleCache();
+		toolGuidelineCache = loadToolGuidelineCapsuleCache();
+		knownSkills.clear();
+		pendingDistillation.clear();
+		pendingToolDistillation.clear();
+	});
+
+	pi.on("tool_result", (event, ctx) => {
+		if (event.isError) return;
+		if (event.toolName === "read" && typeof event.input.path === "string") {
+			const skill = knownSkills.get(normalizeReadPath(event.input.path, ctx.cwd));
+			if (skill && !getValidSkillCapsule(skillCache, skill)) pendingDistillation.add(skill.filePath);
+		}
+		const tool = pi.getAllTools().find((candidate) => candidate.name === event.toolName) as CapabilityTool | undefined;
+		if (tool && tool.sourceInfo?.source && tool.sourceInfo.source !== "builtin" && tool.sourceInfo.source !== "sdk" && (tool.promptGuidelines?.length ?? 0) > 0 && !getValidToolGuidelineCapsule(toolGuidelineCache, tool)) {
+			pendingToolDistillation.add(tool.name);
+		}
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (pendingDistillation.size === 0 && pendingToolDistillation.size === 0) return;
+		const config = loadConfig(ctx.cwd);
+		if (config.enabled === false || config.adaptive?.enabled === false) {
+			pendingDistillation.clear();
+			pendingToolDistillation.clear();
+			return;
+		}
+		if (config.adaptive?.distillSkills !== false) {
+			const pending = [...pendingDistillation];
+			pendingDistillation.clear();
+			let changed = false;
+			for (const filePath of pending) {
+				const skill = knownSkills.get(resolve(filePath));
+				if (!skill || getValidSkillCapsule(skillCache, skill)) continue;
+				try {
+					const capsule = await distillSkill(ctx, config.adaptive ?? {}, skill);
+					if (capsule) {
+						skillCache.skills[skill.filePath] = capsule;
+						saveSkillCapsule(skillCache, skill.filePath, capsule.fingerprint);
+					}
+				} catch (error) {
+					console.warn(`[pi-prompt-diet] Failed to distill ${skill.name}:`, error);
+				}
+			}
+		} else {
+			pendingDistillation.clear();
+		}
+		if (config.adaptive?.distillToolGuidelines !== false) {
+			const pendingTools = [...pendingToolDistillation];
+			pendingToolDistillation.clear();
+			for (const toolName of pendingTools) {
+				const tool = pi.getAllTools().find((candidate) => candidate.name === toolName) as CapabilityTool | undefined;
+				if (!tool || getValidToolGuidelineCapsule(toolGuidelineCache, tool)) continue;
+				try {
+					const capsule = await distillToolGuidelines(ctx, config.adaptive ?? {}, tool);
+					if (!capsule) continue;
+					const key = `${capsule.source}:${capsule.name}`;
+					toolGuidelineCache.tools[key] = capsule;
+					saveToolGuidelineCapsule(toolGuidelineCache, key, tool);
+				} catch (error) {
+					console.warn(`[pi-prompt-diet] Failed to distill guidelines for ${tool.name}:`, error);
+				}
+			}
+		} else {
+			pendingToolDistillation.clear();
+		}
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
-		const cwd = (ctx as any)?.cwd || process.cwd();
+		const cwd = ctx.cwd || process.cwd();
 		const config = loadConfig(cwd);
 
 		if (config.enabled === false) return undefined;
 
-		let prompt = event.systemPrompt;
+		capabilityState.turnRequestCount = 0;
+
+		const allTools = pi.getAllTools();
+		const rawSkills = (event.systemPromptOptions?.skills || [])
+			.filter((skill) => !skill.disableModelInvocation)
+			.map((skill) => ({ name: skill.name, description: skill.description || "", filePath: skill.filePath }));
+		for (const skill of rawSkills) knownSkills.set(resolve(skill.filePath), skill);
+
+		const registeredTools = new Set(allTools.map((tool) => tool.name));
+		const previousRegistered = new Set(capabilityState.registeredTools);
+		const registryAdded = [...registeredTools].filter((name) => !previousRegistered.has(name));
+		const currentPiActive = pi.getActiveTools().filter((name) => registeredTools.has(name));
+		const lastApplied = new Set(capabilityState.lastAppliedTools);
+		const externallyAddedTools = capabilityState.firstRouteCompleted
+			? currentPiActive.filter((name) => !lastApplied.has(name))
+			: [];
+		capabilityState.observedExternalTools = unique([
+			...capabilityState.observedExternalTools.filter((name) => registeredTools.has(name)),
+			...externallyAddedTools,
+		]);
+		capabilityState.registeredTools = [...registeredTools].sort();
+		capabilityState.managedActiveTools = capabilityState.managedActiveTools.filter((name) => registeredTools.has(name));
+		capabilityState.managedActiveSkills = capabilityState.managedActiveSkills.filter((name) => rawSkills.some((skill) => skill.name === name));
+
+		const pureContinuation = isPureContinuation(event.prompt);
+		const shouldRoute = config.adaptive?.enabled !== false && (
+			!capabilityState.firstRouteCompleted
+			|| registryAdded.length > 0
+			|| !(pureContinuation && capabilityState.pendingTask)
+		);
+		let routingSucceeded = false;
+		if (shouldRoute) {
+			try {
+				const candidateRoute = await routeCapabilities(
+					ctx,
+					config.adaptive ?? {},
+					event.prompt,
+					allTools.map((tool) => ({ name: tool.name, description: tool.description })),
+					rawSkills,
+					skillCache,
+					{
+						activeTools: capabilityState.managedActiveTools,
+						activeSkills: capabilityState.managedActiveSkills,
+						recentUserRequests: capabilityState.recentUserRequests,
+						pendingTask: capabilityState.pendingTask,
+						intentSummary: capabilityState.intentSummary,
+						registryAdded,
+					},
+				);
+				if (candidateRoute) {
+					const adaptive = config.adaptive ?? {};
+					const forbidden = new Set(adaptive.neverAutoActivate ?? []);
+					const explicitOnly = new Set(adaptive.requireExplicitUserIntent ?? []);
+					const explicitText = event.prompt.toLowerCase();
+					const maxAdditions = adaptive.maxAdditionsPerRequest ?? 8;
+					const routedTools = candidateRoute.tools
+						.filter((name) => !forbidden.has(name))
+						.filter((name) => !explicitOnly.has(name) || explicitText.includes(name.toLowerCase()))
+						.slice(0, maxAdditions);
+					const routedSkills = candidateRoute.skills.slice(0, maxAdditions - routedTools.length);
+					const alwaysTools = (adaptive.alwaysTools ?? []).filter((name) => registeredTools.has(name));
+					const nextManagedTools = capabilityState.firstRouteCompleted
+						? unique([...capabilityState.managedActiveTools, ...routedTools, REQUEST_CAPABILITIES_TOOL])
+						: unique([...alwaysTools, ...routedTools, REQUEST_CAPABILITIES_TOOL]);
+					const nextTools = capabilityState.firstRouteCompleted
+						? unique([...nextManagedTools, ...capabilityState.observedExternalTools])
+						: nextManagedTools;
+					pi.setActiveTools(nextTools);
+					capabilityState.managedActiveTools = nextManagedTools;
+					capabilityState.managedActiveSkills = unique([...capabilityState.managedActiveSkills, ...routedSkills]);
+					capabilityState.lastAppliedTools = nextTools;
+					capabilityState.firstRouteCompleted = true;
+					routingSucceeded = true;
+				}
+			} catch (error) {
+				console.warn("[pi-prompt-diet] Incremental capability routing failed; preserving current capabilities:", error);
+			}
+		}
+
+		if (capabilityState.firstRouteCompleted && !routingSucceeded && externallyAddedTools.length > 0) {
+			const nextTools = unique([...capabilityState.managedActiveTools, ...capabilityState.observedExternalTools, REQUEST_CAPABILITIES_TOOL]);
+			try {
+				pi.setActiveTools(nextTools);
+				capabilityState.lastAppliedTools = nextTools;
+			} catch (error) {
+				console.warn("[pi-prompt-diet] Failed to preserve externally activated tools:", error);
+			}
+		}
+
+		capabilityState.recentUserRequests = [...capabilityState.recentUserRequests, event.prompt].slice(-4);
+		if (!pureContinuation) {
+			capabilityState.pendingTask = event.prompt;
+			capabilityState.intentSummary = event.prompt;
+		}
+		if (capabilityState.firstRouteCompleted || routingSucceeded) persistCapabilityState();
+
+		const selectedTools = capabilityState.firstRouteCompleted ? new Set(capabilityState.lastAppliedTools) : undefined;
+		const selectedSkills = capabilityState.firstRouteCompleted ? new Set(capabilityState.managedActiveSkills) : undefined;
+		let prompt = selectedTools ? rewriteAvailableTools(event.systemPrompt, selectedTools, allTools) : event.systemPrompt;
 
 		// ── 构建 packages 覆盖映射表 ─────────────────────────────────────────
 		const overrides = new Map<string, PackageOverrideConfig>();
 		if (Array.isArray(config.packages)) {
 			for (const item of config.packages) {
-				if (item && typeof item === "object" && item.source) {
+				if (item && typeof item === "object" && typeof item.source === "string") {
 					const norm = normalizeName(item.source);
 					overrides.set(norm, item);
 					// 同时支持短名称匹配（如 @juicesharp/rpiv-todo 与 rpiv-todo）
@@ -172,22 +682,33 @@ export default function promptDiet(pi: ExtensionAPI) {
 					const nextSectionStart = Math.min(...candidates);
 					const rawGuidelinesList = event.systemPromptOptions?.promptGuidelines || [];
 
-					// 检查是否有 package 被显式覆盖为 "full" 保留
-					const preservedFullRules: string[] = [];
-					for (const g of rawGuidelinesList) {
-						const lower = g.toLowerCase();
-						for (const [pkgName, pkgCfg] of overrides.entries()) {
-							const gMode = typeof pkgCfg.guidelines === "object" ? pkgCfg.guidelines?.mode : pkgCfg.guidelines;
-							if (gMode === "full" && lower.includes(pkgName)) {
-								preservedFullRules.push(`- ${g}`);
-								break;
-							}
+					// 用户显式 override 优先；未配置的第三方工具首次完整保留，真实使用后采用已缓存的 full/capsule 判断。
+					const preservedGuidelines = new Set<string>();
+					for (const tool of allTools) {
+						if (selectedTools && !selectedTools.has(tool.name)) continue;
+						const toolSource = typeof tool.sourceInfo?.source === "string" ? normalizeName(tool.sourceInfo.source) : "";
+						const toolName = normalizeName(tool.name);
+						const pkgCfg = (toolSource ? overrides.get(toolSource) : undefined) || overrides.get(toolName);
+						const explicitMode = typeof pkgCfg?.guidelines === "object" ? pkgCfg.guidelines.mode : pkgCfg?.guidelines;
+						if (explicitMode === "full") {
+							for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
+							continue;
+						}
+						if (explicitMode === "slim" || explicitMode === "strip") continue;
+						const source = tool.sourceInfo?.source;
+						if (!source || source === "builtin" || source === "sdk") continue;
+						const capsule = getValidToolGuidelineCapsule(toolGuidelineCache, tool as CapabilityTool);
+						if (!capsule || capsule.mode === "full") {
+							for (const guideline of tool.promptGuidelines || []) preservedGuidelines.add(guideline);
+						} else {
+							for (const guideline of formatToolGuidelineCapsule(capsule)) preservedGuidelines.add(guideline);
 						}
 					}
+					const preservedFullRules = [...preservedGuidelines].map((guideline) => `- ${guideline}`);
 
 					let slimText = "";
 					if (globalGMode === "slim") {
-						const core = config.guidelines?.customCore ?? DEFAULT_CORE_GUIDELINES;
+						const core = selectedCoreGuidelines(config.guidelines?.customCore, selectedTools);
 						const allLines = [...core, ...preservedFullRules];
 						slimText = `Guidelines:\n${allLines.join("\n")}`;
 					} else if (globalGMode === "strip" && preservedFullRules.length > 0) {
@@ -201,21 +722,21 @@ export default function promptDiet(pi: ExtensionAPI) {
 
 		// ── 2. Skills 处理（支持按包/技能独立指定 compress / strip / full） ────────
 		const globalSMode = config.skills?.mode ?? "compress";
-		if (globalSMode !== "full" || overrides.size > 0) {
+		if (globalSMode !== "full" || overrides.size > 0 || selectedSkills) {
 			const skillsStart = prompt.indexOf("<available_skills>");
 			const skillsEnd = prompt.indexOf("</available_skills>");
 			if (skillsStart !== -1 && skillsEnd !== -1) {
-				const rawSkills = event.systemPromptOptions?.skills || [];
+				const promptSkills = event.systemPromptOptions?.skills || [];
 				const globalMaxLen = config.skills?.maxDescriptionLength ?? 120;
 
 				const activeSkillBlocks: string[] = [];
 
-				for (const s of rawSkills) {
-					if (s.disableModelInvocation) continue;
+				for (const s of promptSkills) {
+					if (s.disableModelInvocation || (selectedSkills && !selectedSkills.has(s.name))) continue;
 
 					// 查找该 Skill 是否命中了 package override
 					const sNameNorm = normalizeName(s.name);
-					const sSourceNorm = s.sourceInfo?.source ? normalizeName(s.sourceInfo.source) : "";
+					const sSourceNorm = typeof s.sourceInfo?.source === "string" ? normalizeName(s.sourceInfo.source) : "";
 					
 					const override = overrides.get(sNameNorm) || (sSourceNorm ? overrides.get(sSourceNorm) : undefined);
 					const rawOverrideSkills = override?.skills;
@@ -266,9 +787,17 @@ export default function promptDiet(pi: ExtensionAPI) {
 					let desc = (s.description || "").trim();
 					if (effectiveMode === "compress" || effectiveMode === "slim") {
 						const maxLen = itemMaxLen ?? override?.maxDescriptionLength ?? globalMaxLen;
-						desc = formatSkillDescription(desc, maxLen);
+						const capabilitySkill = knownSkills.get(resolve(s.filePath));
+						const capsule = config.adaptive?.enabled !== false && capabilitySkill
+							? getValidSkillCapsule(skillCache, capabilitySkill)
+							: undefined;
+						if (capsule) {
+							desc = truncateDescription(formatSkillCapsule(capsule), maxLen);
+						} else if (!selectedSkills) {
+							desc = formatSkillDescription(desc, maxLen);
+						}
 					}
-					// full 模式则原汁原味保留完整 desc
+					// 自适应冷启动保留原始描述；胶囊生成后改用蒸馏内容。full 模式始终保留原描述。
 
 					desc = desc.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 					activeSkillBlocks.push(`  <skill>\n    <name>${s.name}</name>\n    <description>${desc}</description>\n    <location>${s.filePath}</location>\n  </skill>`);
@@ -282,6 +811,9 @@ export default function promptDiet(pi: ExtensionAPI) {
 			}
 		}
 
+		if (selectedTools && selectedSkills) {
+			prompt = appendInactiveCapabilityCatalog(prompt, allTools, selectedTools, rawSkills, selectedSkills);
+		}
 		return { systemPrompt: prompt };
 	});
 }
