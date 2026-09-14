@@ -311,8 +311,22 @@ function cleanDescription(description: string): string {
 
 function shortToolDescription(description: string): string {
 	const clean = cleanDescription(description);
-	if (clean.length <= 180) return clean;
-	return `${clean.slice(0, 177).trimEnd()}...`;
+	// 弹性缓冲区：目标截断线是 350，但如果总长度不超过 450，干脆全盘保留，避免毫无意义的腰斩
+	if (clean.length <= 450) return clean;
+	
+	// 超过 450 的超长描述，执行优雅截断（寻找最近的句号或单词边界）
+	const slice = clean.slice(0, 350);
+	const lastDot = slice.lastIndexOf(". ");
+	let boundary = lastDot;
+	
+	if (boundary < 200) {
+		const lastSpace = slice.lastIndexOf(" ");
+		boundary = lastSpace > 250 ? lastSpace : 350;
+	} else {
+		boundary += 1; // 保留句号
+	}
+	
+	return `${slice.slice(0, boundary).trimEnd()}... (request capability to read full details)`;
 }
 
 function truncateDescription(description: string, maxLength: number): string {
