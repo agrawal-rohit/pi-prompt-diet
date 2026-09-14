@@ -13,7 +13,6 @@ import {
 	loadToolGuidelineCapsuleCache,
 	routeCapabilities,
 	saveSkillCapsule,
-	saveSkillCapsuleCache,
 	saveToolGuidelineCapsule,
 	type AdaptiveConfig,
 	type CapabilitySkill,
@@ -97,6 +96,23 @@ function isPureContinuation(prompt: string): boolean {
 	return PURE_CONTINUATIONS.has(prompt.trim().toLowerCase().replace(/[。.!！]$/, ""));
 }
 
+function routingIntent(prompt: string): string {
+	let remaining = prompt.trimStart();
+	const invokedSkills: string[] = [];
+	while (remaining.startsWith("<skill ")) {
+		const open = remaining.match(/^<skill name="([^"]+)" location="[^"]+">\r?\n/);
+		if (!open) break;
+		const closeMarker = "\n</skill>";
+		const close = remaining.indexOf(closeMarker, open[0].length);
+		if (close === -1) break;
+		invokedSkills.push(open[1]);
+		remaining = remaining.slice(close + closeMarker.length).trimStart();
+	}
+	if (invokedSkills.length === 0) return prompt.trim();
+	const task = remaining.trim();
+	return task || `Explicitly invoked skill: ${invokedSkills.join(", ")}.`;
+}
+
 function restoreCapabilityState(ctx: ExtensionContext): SessionCapabilityState {
 	const branch = ctx.sessionManager.getBranch();
 	for (let index = branch.length - 1; index >= 0; index -= 1) {
@@ -112,7 +128,9 @@ function restoreCapabilityState(ctx: ExtensionContext): SessionCapabilityState {
 			lastAppliedTools: unique(data.lastAppliedTools ?? []),
 			observedExternalTools: unique(data.observedExternalTools ?? []),
 			registeredTools: unique(data.registeredTools ?? []),
-			recentUserRequests: (data.recentUserRequests ?? []).slice(-4),
+			recentUserRequests: (data.recentUserRequests ?? []).map(routingIntent).filter(Boolean).slice(-4),
+			pendingTask: data.pendingTask ? routingIntent(data.pendingTask) : undefined,
+			intentSummary: data.intentSummary ? routingIntent(data.intentSummary) : undefined,
 		};
 	}
 	return emptyCapabilityState();
@@ -289,8 +307,13 @@ function selectedCoreGuidelines(customCore: string[] | undefined, selectedTools?
 
 function shortToolDescription(description: string): string {
 	const clean = description.trim().replace(/\s+/g, " ");
-	if (clean.length <= 180) return clean;
-	return `${clean.slice(0, 177).trimEnd()}...`;
+	if (clean.length <= 350) return clean;
+	const slice = clean.slice(0, 350);
+	const lastDot = slice.lastIndexOf(". ");
+	if (lastDot > 150) return slice.slice(0, lastDot + 1);
+	const lastSpace = slice.lastIndexOf(" ");
+	const boundary = lastSpace > 250 ? lastSpace : slice.length - 3;
+	return `${slice.slice(0, boundary).trimEnd()}...`;
 }
 
 function truncateDescription(description: string, maxLength: number): string {
@@ -319,6 +342,10 @@ function normalizeReadPath(path: string, cwd: string): string {
 }
 
 export default function promptDiet(pi: ExtensionAPI) {
+	if (process.env.PI_PROMPT_DIET_DISABLE === "1" || process.env.PI_PROMPT_DIET_DISABLE === "true") {
+		return;
+	}
+
 	let capabilityState = emptyCapabilityState();
 	let skillCache = loadSkillCapsuleCache();
 	let toolGuidelineCache = loadToolGuidelineCapsuleCache();
@@ -347,7 +374,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const config = loadConfig(ctx.cwd).adaptive ?? {};
-			const maxRequestsPerTurn = (config as any).maxRequestsPerTurn ?? 2;
+			const maxRequestsPerTurn = config.maxRequestsPerTurn ?? 2;
 			const currentTurnRequests = capabilityState.turnRequestCount ?? 0;
 			if (currentTurnRequests >= maxRequestsPerTurn) {
 				return {
@@ -369,7 +396,11 @@ export default function promptDiet(pi: ExtensionAPI) {
 				};
 			}
 
+			// Count every attempt, including rejected requests and activation failures.
+			capabilityState.turnRequestCount = currentTurnRequests + 1;
+			persistCapabilityState();
 			const allTools = pi.getAllTools();
+			const current = pi.getActiveTools();
 			const availableTools = new Set(allTools.map((tool) => tool.name));
 			const availableSkills = new Set([...knownSkills.values()].map((skill) => skill.name));
 			const requestedTools = unique(params.tools ?? []);
@@ -402,33 +433,46 @@ export default function promptDiet(pi: ExtensionAPI) {
 			};
 
 			const validTools = requestedTools.filter((name) => validate(name, "tool", availableTools));
-			const validSkills = requestedSkills.filter((name) => validate(name, "skill", availableSkills));
-			const additions = [...validTools.filter((name) => !capabilityState.managedActiveTools.includes(name)), ...validSkills.filter((name) => !capabilityState.managedActiveSkills.includes(name))];
+			let validSkills = requestedSkills.filter((name) => validate(name, "skill", availableSkills));
+			if (validSkills.length > 0 && !current.includes("read") && !validTools.includes("read")) {
+				if (validate("read", "tool", availableTools)) validTools.push("read");
+				else {
+					for (const name of validSkills) failures.push({ capability: name, code: "dependency_unavailable", message: "Skill activation requires the read tool." });
+					validSkills = [];
+				}
+			}
+			const additions = [...validTools.filter((name) => !current.includes(name)), ...validSkills.filter((name) => !capabilityState.managedActiveSkills.includes(name))];
 			if (additions.length > maxAdditions) {
 				return { content: [{ type: "text", text: `Capability request failed: at most ${maxAdditions} additions are allowed per request.` }], details: { status: "failed", addedTools: [], addedSkills: [], unavailable, failures: [...failures, { capability: additions.join(","), code: "too_many_additions", message: `Maximum is ${maxAdditions}.` }] } };
 			}
 
-			const addedTools = validTools.filter((name) => !capabilityState.managedActiveTools.includes(name));
+			const addedTools = validTools.filter((name) => !current.includes(name));
 			const addedSkills = validSkills.filter((name) => !capabilityState.managedActiveSkills.includes(name));
-			const current = pi.getActiveTools();
 			const nextTools = unique([...current, ...addedTools, REQUEST_CAPABILITIES_TOOL]);
 			try {
 				if (addedTools.length > 0) pi.setActiveTools(nextTools);
 			} catch (error) {
 				return { content: [{ type: "text", text: `Capability activation failed: ${error instanceof Error ? error.message : String(error)}` }], details: { status: "failed", addedTools: [], addedSkills: [], unavailable, failures } };
 			}
-			capabilityState.managedActiveTools = unique([...capabilityState.managedActiveTools, ...addedTools, REQUEST_CAPABILITIES_TOOL]);
+			capabilityState.managedActiveTools = unique([...capabilityState.managedActiveTools, ...validTools, REQUEST_CAPABILITIES_TOOL]);
 			capabilityState.managedActiveSkills = unique([...capabilityState.managedActiveSkills, ...addedSkills]);
 			capabilityState.lastAppliedTools = nextTools;
 			capabilityState.registeredTools = [...availableTools].sort();
-			capabilityState.turnRequestCount = currentTurnRequests + 1;
 			capabilityState.totalExpansions = (capabilityState.totalExpansions ?? 0) + addedTools.length;
 			capabilityState.pendingTask = params.reason;
 			persistCapabilityState();
-			const status = failures.length || unavailable.length ? "partial" : addedTools.length || addedSkills.length ? "activated" : "already_active";
+			const status = failures.length || unavailable.length
+				? validTools.length || validSkills.length ? "partial" : "failed"
+				: addedTools.length || addedSkills.length ? "activated" : "already_active";
+			const disclosedSkills = [...knownSkills.values()]
+				.filter((skill) => validSkills.includes(skill.name))
+				.map((skill) => ({ name: skill.name, description: skill.description, filePath: skill.filePath }));
+			const skillInstructions = disclosedSkills.length > 0
+				? `\nRead the relevant SKILL.md before using its workflow:\n${JSON.stringify(disclosedSkills)}` : "";
+			const issues = failures.length || unavailable.length ? `\n${JSON.stringify({ unavailable, failures })}` : "";
 			return {
-				content: [{ type: "text", text: addedSkills.length > 0 ? `Capabilities ${status}. Added tools: ${addedTools.join(", ") || "none"}; Skills recorded for subsequent agent starts: ${addedSkills.join(", ")}.` : `Capabilities ${status}. Added tools: ${addedTools.join(", ") || "none"}.` }],
-				details: { status, addedTools, addedSkills, unavailable, failures },
+				content: [{ type: "text", text: `Capabilities ${status}. Added tools: ${addedTools.join(", ") || "none"}.${skillInstructions}${issues}` }],
+				details: { status, addedTools, addedSkills, skills: disclosedSkills, unavailable, failures },
 			};
 		},
 	});
@@ -508,7 +552,6 @@ export default function promptDiet(pi: ExtensionAPI) {
 		if (config.adaptive?.distillSkills !== false) {
 			const pending = [...pendingDistillation];
 			pendingDistillation.clear();
-			let changed = false;
 			for (const filePath of pending) {
 				const skill = knownSkills.get(resolve(filePath));
 				if (!skill || getValidSkillCapsule(skillCache, skill)) continue;
@@ -558,6 +601,7 @@ export default function promptDiet(pi: ExtensionAPI) {
 		const rawSkills = (event.systemPromptOptions?.skills || [])
 			.filter((skill) => !skill.disableModelInvocation)
 			.map((skill) => ({ name: skill.name, description: skill.description || "", filePath: skill.filePath }));
+		knownSkills.clear();
 		for (const skill of rawSkills) knownSkills.set(resolve(skill.filePath), skill);
 
 		const registeredTools = new Set(allTools.map((tool) => tool.name));
@@ -576,7 +620,8 @@ export default function promptDiet(pi: ExtensionAPI) {
 		capabilityState.managedActiveTools = capabilityState.managedActiveTools.filter((name) => registeredTools.has(name));
 		capabilityState.managedActiveSkills = capabilityState.managedActiveSkills.filter((name) => rawSkills.some((skill) => skill.name === name));
 
-		const pureContinuation = isPureContinuation(event.prompt);
+		const routePrompt = routingIntent(event.prompt);
+		const pureContinuation = isPureContinuation(routePrompt);
 		const shouldRoute = config.adaptive?.enabled !== false && (
 			!capabilityState.firstRouteCompleted
 			|| registryAdded.length > 0
@@ -588,12 +633,12 @@ export default function promptDiet(pi: ExtensionAPI) {
 				const candidateRoute = await routeCapabilities(
 					ctx,
 					config.adaptive ?? {},
-					event.prompt,
+					routePrompt,
 					allTools.map((tool) => ({ name: tool.name, description: tool.description })),
 					rawSkills,
 					skillCache,
 					{
-						activeTools: capabilityState.managedActiveTools,
+						activeTools: unique([...capabilityState.managedActiveTools, ...capabilityState.observedExternalTools, REQUEST_CAPABILITIES_TOOL]),
 						activeSkills: capabilityState.managedActiveSkills,
 						recentUserRequests: capabilityState.recentUserRequests,
 						pendingTask: capabilityState.pendingTask,
@@ -605,13 +650,12 @@ export default function promptDiet(pi: ExtensionAPI) {
 					const adaptive = config.adaptive ?? {};
 					const forbidden = new Set(adaptive.neverAutoActivate ?? []);
 					const explicitOnly = new Set(adaptive.requireExplicitUserIntent ?? []);
-					const explicitText = event.prompt.toLowerCase();
+					const explicitText = routePrompt.toLowerCase();
 					const maxAdditions = adaptive.maxAdditionsPerRequest ?? 8;
 					const routedTools = candidateRoute.tools
 						.filter((name) => !forbidden.has(name))
 						.filter((name) => !explicitOnly.has(name) || explicitText.includes(name.toLowerCase()))
 						.slice(0, maxAdditions);
-					const routedSkills = candidateRoute.skills.slice(0, maxAdditions - routedTools.length);
 					const alwaysTools = (adaptive.alwaysTools ?? []).filter((name) => registeredTools.has(name));
 					const nextManagedTools = capabilityState.firstRouteCompleted
 						? unique([...capabilityState.managedActiveTools, ...routedTools, REQUEST_CAPABILITIES_TOOL])
@@ -619,6 +663,10 @@ export default function promptDiet(pi: ExtensionAPI) {
 					const nextTools = capabilityState.firstRouteCompleted
 						? unique([...nextManagedTools, ...capabilityState.observedExternalTools])
 						: nextManagedTools;
+					const routedSkills = nextTools.includes("read") ? candidateRoute.skills
+						.filter((name) => !forbidden.has(name))
+						.filter((name) => !explicitOnly.has(name) || explicitText.includes(name.toLowerCase()))
+						.slice(0, maxAdditions - routedTools.length) : [];
 					pi.setActiveTools(nextTools);
 					capabilityState.managedActiveTools = nextManagedTools;
 					capabilityState.managedActiveSkills = unique([...capabilityState.managedActiveSkills, ...routedSkills]);
@@ -641,10 +689,10 @@ export default function promptDiet(pi: ExtensionAPI) {
 			}
 		}
 
-		capabilityState.recentUserRequests = [...capabilityState.recentUserRequests, event.prompt].slice(-4);
+		capabilityState.recentUserRequests = [...capabilityState.recentUserRequests, routePrompt].filter(Boolean).slice(-4);
 		if (!pureContinuation) {
-			capabilityState.pendingTask = event.prompt;
-			capabilityState.intentSummary = event.prompt;
+			capabilityState.pendingTask = routePrompt;
+			capabilityState.intentSummary = routePrompt;
 		}
 		if (capabilityState.firstRouteCompleted || routingSucceeded) persistCapabilityState();
 
@@ -680,7 +728,6 @@ export default function promptDiet(pi: ExtensionAPI) {
 
 				if (candidates.length > 0) {
 					const nextSectionStart = Math.min(...candidates);
-					const rawGuidelinesList = event.systemPromptOptions?.promptGuidelines || [];
 
 					// 用户显式 override 优先；未配置的第三方工具首次完整保留，真实使用后采用已缓存的 full/capsule 判断。
 					const preservedGuidelines = new Set<string>();
@@ -792,7 +839,8 @@ export default function promptDiet(pi: ExtensionAPI) {
 							? getValidSkillCapsule(skillCache, capabilitySkill)
 							: undefined;
 						if (capsule) {
-							desc = truncateDescription(formatSkillCapsule(capsule), maxLen);
+							// Capsules are already bounded by the distiller. Keep complete constraints.
+							desc = formatSkillCapsule(capsule);
 						} else if (!selectedSkills) {
 							desc = formatSkillDescription(desc, maxLen);
 						}

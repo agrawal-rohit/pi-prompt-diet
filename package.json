@@ -1,6 +1,6 @@
 {
   "name": "pi-prompt-diet",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "An adaptive capability router for Pi with progressive tool-guideline and Skill distillation.",
   "type": "module",
   "main": "index.ts",

@@ -32,7 +32,7 @@ A standard setup with 8–10 packages often results in:
 4. **Progressive Tool Disclosure**: Inactive tools appear only as a compact name-and-purpose index. Once activated, Pi supplies their original, complete parameter schemas. The executable schema is never replaced by an AI summary.
 5. **Constraint-First Tool and Skill Distillation**: An unknown third-party tool keeps its complete author-written guidelines on first use. After a successful real call, a background model either caches `full` when the rules are already dense, or creates a concise guideline capsule that prioritizes negative constraints ("never", "do not") and sequential ordering. Skills are distilled after the main model reads the full `SKILL.md`.
 6. **Content-Addressed Cache with CAS & Distiller Versioning**: Tool decisions live independently under `~/.pi/agent/cache/pi-prompt-diet/tools/`; Skill capsules live under `~/.pi/agent/cache/pi-prompt-diet/skills/`. SHA-256 fingerprints combine source content with `DISTILLER_VERSION` and use Compare-And-Swap checks to prevent stale concurrent overwrites.
-7. **Session Persistence, Commands & Observability**: Capability state is persisted in the Pi session, while `/prompt-diet` command provides instant inspection into active/inactive tools, cache counts, and expansion stats.
+7. **Session Persistence, Commands & Observability**: Capability state is persisted in the Pi session, while `/pi-prompt-diet` command provides instant inspection into active/inactive tools, cache counts, and expansion stats.
 8. **Hierarchical Overrides**: Existing global and per-package `slim` / `strip` / `full` policies remain available and apply after routing.
 
 #### Disclosure Levels
@@ -40,7 +40,7 @@ A standard setup with 8–10 packages often results in:
 | Level | What the main model receives | Purpose |
 |---|---|---|
 | **Capability index** | Inactive tool/Skill name, type, and one-line purpose | Discover what can be requested without paying for every schema |
-| **Active tool** | Original tool description and complete parameter schema | Make the tool safely callable |
+| **Active tool** | Original tool description (safely bounded to 350 chars) and complete parameter schema | Make the tool safely callable |
 | **Active Skill** | Original description or distilled capsule plus the `SKILL.md` path | Route to the right workflow guidance |
 | **Full Skill** | Complete `SKILL.md`, read on demand | Apply detailed rules and edge cases |
 
@@ -125,6 +125,8 @@ This outputs a diagnostic overview:
     "enabled": true,
     "maxTools": 16,
     "maxSkills": 8,
+    "maxRequestsPerTurn": 2,
+    "maxAdditionsPerRequest": 8,
     "distillSkills": true,
     "distillToolGuidelines": true
   },
@@ -135,6 +137,12 @@ This outputs a diagnostic overview:
 There is no built-in package whitelist. An unrecognized third-party tool is cold-started with its complete author guidelines. After the tool is actually called successfully, the evaluator caches either `full` (already concise or unsafe to shorten) or a concise capsule. Explicit package overrides still take precedence and disable automatic treatment for that package.
 
 The router uses the current session model by default. Set `adaptive.model` to a `provider/model` id to use a cheaper dedicated model. The first successful route may shrink Pi's initial broad tool set; after that, Prompt Diet only adds capabilities. Later `before_agent_start` hooks refresh the registry and run incremental routing when the request or catalog changes. Short continuation prompts such as “continue” reuse the persisted pending-task context when available. If routing or activation fails, Prompt Diet preserves the current capability set instead of shrinking it.
+
+Recovery requests disclose selected Skills immediately with their original description and `SKILL.md` path. If needed, `read` is activated in the same call and counts toward `adaptive.maxAdditionsPerRequest` (default `8`). Every attempted call, including validation or activation failures, counts toward `adaptive.maxRequestsPerTurn` (default `2`); the counter resets on the next user turn. `neverAutoActivate` and `requireExplicitUserIntent` apply to both tool and Skill names. The latter is a name-mention check, not a semantic authorization classifier.
+
+When no inactive capabilities remain, routing skips the model call. Duplicate Skill selections are deduplicated before applying `maxSkills`. Active Skills are excluded before reading and hashing cached Skill files for the router catalog.
+
+Validated Skill capsules are included whole: at most four rules, with each rule, trigger, and full-read condition limited to 300 characters. The static `skills.maxDescriptionLength` limit does not cut these capsules. Invalid or oversized Skill distillations fall back to the original description; invalid, oversized, or non-saving tool capsules keep the full guidelines. Malformed cache entries are ignored. Distiller version `v3.2` invalidates older fingerprints so previously truncated capsules are rebuilt after subsequent use.
 
 #### Advanced Granular Overrides (`packages` Array)
 
@@ -175,7 +183,7 @@ The router uses the current session model by default. Set `adaptive.model` to a 
 |----------------------|-------------------------------|---------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
 | **Global**           | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                                         | Default guideline treatment across all packages.                                                |
 | **Global**           | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                                     | Default skill description treatment (natural sentence-first algorithm).                         |
-| **Global**           | `skills.maxDescriptionLength` | `number` (default: `200`)                                                                                                 | Max character limit when compressing skill descriptions or cached capsules.                     |
+| **Global**           | `skills.maxDescriptionLength` | `number` (default: `200`)                                                                                                 | Max characters for static description compression; validated adaptive capsules retain complete rules.                     |
 | **Adaptive**         | `adaptive.enabled`            | `boolean` (default: `true`)                                                                                               | Enable minimal initial routing and later incremental capability routing.                          |
 | **Adaptive**         | `adaptive.model`              | `"provider/model"`                                                                                                       | Optional dedicated router/distiller model; defaults to the active session model.                 |
 | **Adaptive**         | `adaptive.alwaysTools`         | `string[]`                                                                                                                | Valid tool names always included in the selected set.                                            |
@@ -234,8 +242,7 @@ pi install npm:pi-prompt-diet
 4. **工具由浅至深披露**：未激活工具只以“名称 + 类型 + 一句话用途”的目录形式出现；激活后由 Pi 提供原始、完整的参数 Schema。可执行 Schema 不会被 AI 蒸馏版本替代。
 5. **约束优先的工具与 Skill 蒸馏**：陌生第三方工具首次完整保留作者规则，使用后评估并优先提取负向约束（"never", "do not"）与执行顺序；若规则已精炼则直接缓存为 `full`。Skill 在首次完整读取后自动提炼关键规则胶囊。
 6. **带版本锁与 CAS 的内容寻址缓存**：工具与 Skill 胶囊分别独立保存于 `~/.pi/agent/cache/pi-prompt-diet/tools/` 与 `skills/`；指纹混入 `DISTILLER_VERSION` 并采用 CAS 校验，防止并发竞争写入脏数据。
-7. **会话持久化与 `/prompt-diet` 可观测性**：能力状态持久化到 Pi Session；可随时通过 `/prompt-diet` 命令查看当前活跃工具、未激活目录、胶囊缓存量与会话扩容指标。
-7. **会话持久化与动态发现**：能力状态写入 Pi Session；每次 `before_agent_start` 都刷新工具 Registry，因此其他扩展中途注册的工具也能在后续被发现。
+7. **会话持久化与 `/pi-prompt-diet` 可观测性**：能力状态持久化到 Pi Session；可随时通过 `/pi-prompt-diet` 命令查看当前活跃工具、未激活目录、胶囊缓存量与会话扩容指标。
 8. **分层覆盖保持兼容**：原有全局与包级 `slim` / `strip` / `full` 策略继续生效。
 
 #### 能力披露层级
@@ -243,7 +250,7 @@ pi install npm:pi-prompt-diet
 | 层级 | 主模型收到的内容 | 目的 |
 |---|---|---|
 | **能力索引** | 未激活工具/Skill 的名称、类型和一句话用途 | 低成本知道“还能申请什么” |
-| **活动工具** | 工具原始描述和完整参数 Schema | 让模型真正、正确地发起工具调用 |
+| **活动工具** | 工具原始描述（安全截断至 350 字符）和完整参数 Schema | 让模型真正、正确地发起工具调用 |
 | **活动 Skill** | 原始描述或蒸馏胶囊，以及 `SKILL.md` 路径 | 将模型路由到正确的工作流指导 |
 | **完整 Skill** | 按需读取的完整 `SKILL.md` | 执行详细规则、边界条件和复杂流程 |
 
@@ -319,6 +326,8 @@ pi install npm:pi-prompt-diet
     "enabled": true,
     "maxTools": 16,
     "maxSkills": 8,
+    "maxRequestsPerTurn": 2,
+    "maxAdditionsPerRequest": 8,
     "distillSkills": true,
     "distillToolGuidelines": true
   },
@@ -331,6 +340,12 @@ pi install npm:pi-prompt-diet
 路由器默认复用当前会话模型，也可通过 `adaptive.model` 指定更便宜的 `provider/model`。首轮成功路由可以缩减 Pi 初始的宽泛工具集合；完成首次接管后，Prompt Diet 只增加能力。后续 `before_agent_start` 会刷新 Registry，并在需求或目录变化时做增量路由；“继续”等短输入在存在已持久化 `pendingTask` 时复用 continuation context。路由或激活失败时保留当前能力集合，不会继续缩减。
 
 #### 进阶包微调与全场景覆盖示例 (`packages` 数组)
+
+补充能力时会立即返回入选 Skill 的原始描述和 `SKILL.md` 路径；如需启用 `read`，会在同一次调用中完成，并计入 `adaptive.maxAdditionsPerRequest`（默认 `8`）。每次调用尝试都计入 `adaptive.maxRequestsPerTurn`（默认 `2`），包括校验失败与激活失败，下一轮用户请求重置计数。`neverAutoActivate` 和 `requireExplicitUserIntent` 同时作用于工具名和 Skill 名；后者检查名称是否被提及，不是语义授权判定器。
+
+没有剩余未激活能力时跳过路由模型调用；重复 Skill 名先去重再应用 `maxSkills` 限制。构建路由目录时先排除已激活 Skill，避免为它们重复读取文件和计算指纹。
+
+有效 Skill 胶囊整体保留：最多四条规则，每条规则、触发条件和完整读取条件各限 300 字符，不再受静态 `skills.maxDescriptionLength` 二次截断。Skill 蒸馏结果无效或超长时回退原描述；工具胶囊无效、超限或比原文更长时保留完整 Guidelines。损坏缓存会被忽略。蒸馏版本升级到 `v3.2`，旧指纹自动失效，后续实际使用后重新生成，避免复用已截断的胶囊。
 
 `pi-prompt-diet` 在 `packages` 数组中支持多种灵活的细粒度覆盖语法：
 
@@ -369,7 +384,7 @@ pi install npm:pi-prompt-diet
 |--------------|-------------------------------|---------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------|
 | **全局默认** | `guidelines.mode`             | `"slim"` \| `"strip"` \| `"full"`                                                                                         | 全局通用的 Guidelines 处理策略（默认 `"slim"`）。                         |
 | **全局默认** | `skills.mode`                 | `"compress"` \| `"strip"` \| `"full"`                                                                                     | 全局通用的技能描述处理策略（默认自然首句优先智能浓缩）。                  |
-| **全局默认** | `skills.maxDescriptionLength` | `number` (默认 `200`)                                                                                                     | 浓缩 Skill 描述或缓存胶囊时的最大字符数。                                 |
+| **全局默认** | `skills.maxDescriptionLength` | `number` (默认 `200`)                                                                                                     | 静态描述压缩的字符上限；经过校验的自适应胶囊保留完整规则，不再次截断。                                 |
 | **自适应**   | `adaptive.enabled`            | `boolean`（默认 `true`）                                                                                                  | 启用首轮最小路由与后续增量能力路由。                                      |
 | **自适应**   | `adaptive.model`              | `"provider/model"`                                                                                                       | 可选专用路由/蒸馏模型；默认使用当前会话模型。                             |
 | **自适应**   | `adaptive.alwaysTools`         | `string[]`                                                                                                                | 无论路由结果如何都保留的有效工具名称。                                    |
