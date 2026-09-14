@@ -66,7 +66,7 @@ Because Pi concatenates all guidelines linearly, the baseline System Prompt quic
 1. **Incremental Capability Route**:
    - `before_agent_start` refreshes registered capabilities and routes newly required names using the current request plus continuation state.
    - The first successful route may shrink the initial broad set; later changes are additive. `request_capabilities` provides an always-active recovery path inside the same agent run.
-   - State is persisted in the Pi session, and routing or activation failures never shrink the current set.
+   - State is persisted in the Pi session, and routing or activation failures never shrink the current set. Recovery exposes Skill paths immediately and activates their read dependency within the additions budget. Failed attempts consume the per-turn request budget. Empty inactive catalogs skip the router model call.
 2. **Hierarchical Configuration Pipeline**:
    - Explicit per-package policies remain authoritative.
    - Without an override, a third-party tool keeps its complete author-written guidelines on first successful use. Afterward, a cached evaluator decision either keeps `full` or uses a safe capsule.
@@ -79,7 +79,7 @@ Because Pi concatenates all guidelines linearly, the baseline System Prompt quic
    - Tool decisions are stored independently under `~/.pi/agent/cache/pi-prompt-diet/tools/`; Skill capsules use `~/.pi/agent/cache/pi-prompt-diet/skills/`.
    - Fingerprints combine content/metadata with `DISTILLER_VERSION`.
    - Compare-And-Swap (CAS) validation ensures concurrent modifications to source files/metadata do not get overwritten with stale distillations.
-   - Original plugin metadata and physical Skill files are never modified.
+   - Original plugin metadata and physical Skill files are never modified. Capsules are structurally validated before use. Complete bounded rules are retained without character slicing; invalid Skill summaries fall back to original descriptions, and unsafe or non-saving tool summaries keep full guidelines. Distiller version v3.2 invalidates earlier capsule fingerprints.
 
 ---
 
@@ -113,7 +113,7 @@ Because Pi concatenates all guidelines linearly, the baseline System Prompt quic
 1. **增量能力路由**：
    - 每次 `before_agent_start` 刷新能力目录，结合当前请求和 continuation state 选择新增能力；
    - 首次成功路由可以缩减初始宽泛集合，后续只增加；常驻 `request_capabilities` 可在同一个 Agent run 内补充工具；
-   - 状态持久化到 Pi Session，路由或激活失败不缩减现有集合。
+   - 状态持久化到 Pi Session，路由或激活失败不缩减现有集合。补充 Skill 会立即披露路径，并在新增预算内启用 read 依赖；失败尝试计入每轮请求预算。没有未激活能力时跳过路由模型调用。
 2. **分层配置继续生效**：
    - 用户显式包级策略始终优先；
    - 无 override 的第三方工具第一次成功使用时完整保留作者 Guidelines，之后采用缓存的 `full` 判断或安全胶囊；
@@ -126,4 +126,4 @@ Because Pi concatenates all guidelines linearly, the baseline System Prompt quic
    - 工具判断独立写入 `~/.pi/agent/cache/pi-prompt-diet/tools/`，Skill 胶囊写入 `~/.pi/agent/cache/pi-prompt-diet/skills/`；
    - 指纹混入 `DISTILLER_VERSION`；写入时执行 CAS (Compare-And-Swap) 校验，防止并发写入陈旧数据；
    - 工具指纹覆盖名称、描述、参数、Guidelines、来源与版本锁；Skill 指纹覆盖文件内容与版本锁，变化后自动回到冷启动；
-   - 原始插件元数据与 Skill 文件始终不被修改。
+   - 原始插件元数据与 Skill 文件始终不被修改。缓存使用前校验结构；已限制长度的完整规则不再裁切。Skill 摘要无效时回退原描述，工具摘要不安全或没有节省字符时保留完整 Guidelines。蒸馏版本 v3.2 使旧胶囊指纹失效。

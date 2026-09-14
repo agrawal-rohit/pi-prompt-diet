@@ -15,6 +15,7 @@ export interface AdaptiveConfig {
 	neverAutoActivate?: string[];
 	requireExplicitUserIntent?: string[];
 	maxAdditionsPerRequest?: number;
+	maxRequestsPerTurn?: number;
 }
 
 export interface CapabilityTool {
@@ -55,7 +56,7 @@ export interface SkillCapsule {
 	generatedAt: string;
 }
 
-export const DISTILLER_VERSION = "v3.1";
+export const DISTILLER_VERSION = "v3.2";
 
 export interface SkillCapsuleCache {
 	version: 1;
@@ -86,7 +87,7 @@ export interface ToolGuidelineCapsuleCache {
 
 const ROUTER_SYSTEM_PROMPT = `You are an incremental capability router for a coding agent. Select only newly required registered tools and skills that are not already active.
 Return JSON only, with exactly this shape: {"tools":["tool-name"],"skills":["skill-name"]}.
-Use the current request together with continuation context and recent requests. A short continuation such as "continue" inherits the pending task. Only return names present in the supplied inactive catalog. Prefer recall when a missing capability would block completion, but do not select unrelated capabilities. A skill is guidance, while a tool is executable. If a newly selected skill must be opened, include read when it is inactive and available. Do not answer the user and do not emit prose.`
+Use the current request together with continuation context and recent requests. A short continuation such as "continue" inherits the pending task. Only return names present in the supplied inactive catalog. Prefer recall when a missing capability would block completion, but do not select unrelated capabilities. Honor explicit prohibitions and hypothetical/planning-only framing: if the user says not to call, use, delegate, execute, or modify, do not activate capabilities for that prohibited action merely because capability names or execution scenarios are mentioned. A skill is guidance, while a tool is executable. If a newly selected skill must be opened, include read when it is inactive and available. Do not answer the user and do not emit prose.`
 
 const DISTILL_SYSTEM_PROMPT = `You distill a reusable routing capsule from one agent Skill file. Return JSON only with exactly this shape: {"trigger":"...","essentialRules":["..."],"readFullWhen":"..."}.
 The trigger must state when the skill applies.
@@ -94,12 +95,12 @@ Extract at most four non-obvious, operationally critical rules:
 - Prioritize negative constraints ("never", "do not", "must not") and safety/data-integrity limits.
 - Prioritize sequential ordering and prerequisite rules ("before X, always Y", "after 1-2 tries, stop").
 - Keep concrete boundaries rather than generic advice.
-The readFullWhen field must state when the agent should open the complete Skill file for full workflows or edge cases. Do not invent rules and keep the result concise.`;
+The readFullWhen field must state when the agent should open the complete Skill file for full workflows or edge cases. Each text field and rule must be at most 300 characters and contain complete statements. Do not invent rules and keep the result concise.`;
 
 const TOOL_GUIDELINE_DISTILL_SYSTEM_PROMPT = `You evaluate the prompt guidelines of one third-party agent tool after it has been used. Return JSON only in one of these exact shapes:
 {"mode":"full","reason":"..."}
 {"mode":"capsule","essentialRules":["..."],"reason":"..."}
-Choose full when the original guidelines are already concise, semantically dense, safety-critical, contain strict sequential orders or negative constraints, or cannot be shortened without changing tool-call behavior. Choose capsule only when real redundancy can be removed while strictly preserving every non-obvious operational rule, parameter semantic, stop condition, negative constraint ("do not", "never"), and concurrency/data-integrity constraint. Keep at most four concise rules. Never invent a rule. Do not choose capsule merely to reduce character count.`;
+Choose full when the original guidelines are already concise, semantically dense, safety-critical, contain strict sequential orders or negative constraints, or cannot be shortened without changing tool-call behavior. Choose capsule only when real redundancy can be removed while strictly preserving every non-obvious operational rule, parameter semantic, stop condition, negative constraint ("do not", "never"), and concurrency/data-integrity constraint. Keep at most four complete rules of at most 320 characters each; choose full if preserving all constraints needs more space. Never invent a rule. Do not choose capsule merely to reduce character count.`;
 
 function cacheRoot(): string {
 	return join(homedir(), ".pi", "agent", "cache", "pi-prompt-diet");
@@ -149,7 +150,9 @@ export function loadSkillCapsuleCache(): SkillCapsuleCache {
 		try {
 			const legacy = JSON.parse(readFileSync(legacyPath, "utf8")) as SkillCapsuleCache;
 			if (legacy.version === 1 && legacy.skills && typeof legacy.skills === "object") {
-				Object.assign(cache.skills, legacy.skills);
+				for (const capsule of Object.values(legacy.skills)) {
+					if (isSkillCapsule(capsule)) cache.skills[capsule.filePath] = capsule;
+				}
 				loadedLegacy = true;
 			}
 		} catch {}
@@ -160,7 +163,7 @@ export function loadSkillCapsuleCache(): SkillCapsuleCache {
 			if (!file.endsWith(".json")) continue;
 			try {
 				const capsule = JSON.parse(readFileSync(join(directory, file), "utf8")) as SkillCapsule;
-				if (capsule && typeof capsule.filePath === "string" && typeof capsule.fingerprint === "string") {
+				if (isSkillCapsule(capsule)) {
 					cache.skills[capsule.filePath] = capsule;
 				}
 			} catch {}
@@ -202,7 +205,7 @@ export function loadToolGuidelineCapsuleCache(): ToolGuidelineCapsuleCache {
 		if (!file.endsWith(".json")) continue;
 		try {
 			const capsule = JSON.parse(readFileSync(join(directory, file), "utf8")) as ToolGuidelineCapsule;
-			if (capsule && typeof capsule.name === "string" && typeof capsule.source === "string" && typeof capsule.fingerprint === "string") {
+			if (isToolCapsule(capsule)) {
 				cache.tools[`${capsule.source}:${capsule.name}`] = capsule;
 			}
 		} catch {}
@@ -235,7 +238,7 @@ export function fingerprintToolGuidelines(tool: CapabilityTool): string {
 
 export function getValidToolGuidelineCapsule(cache: ToolGuidelineCapsuleCache, tool: CapabilityTool): ToolGuidelineCapsule | undefined {
 	const capsule = cache.tools[toolCacheKey(tool)];
-	return capsule?.fingerprint === fingerprintToolGuidelines(tool) ? capsule : undefined;
+	return isToolCapsule(capsule) && capsule.fingerprint === fingerprintToolGuidelines(tool) ? capsule : undefined;
 }
 
 export function formatToolGuidelineCapsule(capsule: ToolGuidelineCapsule): string[] {
@@ -255,7 +258,7 @@ export function fingerprintSkill(filePath: string): string | undefined {
 
 export function getValidSkillCapsule(cache: SkillCapsuleCache, skill: CapabilitySkill): SkillCapsule | undefined {
 	const capsule = cache.skills[skill.filePath];
-	if (!capsule) return undefined;
+	if (!isSkillCapsule(capsule)) return undefined;
 	const fingerprint = fingerprintSkill(skill.filePath);
 	return fingerprint && capsule.fingerprint === fingerprint ? capsule : undefined;
 }
@@ -319,12 +322,33 @@ async function completeJson(
 	return parseJsonObject(responseText(response));
 }
 
-function stringArray(value: unknown): string[] {
-	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-}
-
 function strictStringArray(value: unknown): string[] | undefined {
 	return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
+}
+
+function conciseText(value: unknown, maxLength: number): value is string {
+	return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;
+}
+
+function completeRules(value: unknown, maxLength: number): value is string[] {
+	return Array.isArray(value) && value.length <= 4 && value.every((rule) => conciseText(rule, maxLength));
+}
+
+function isSkillCapsule(value: unknown): value is SkillCapsule {
+	if (!value || typeof value !== "object") return false;
+	const capsule = value as SkillCapsule;
+	return typeof capsule.name === "string" && typeof capsule.filePath === "string"
+		&& typeof capsule.fingerprint === "string" && conciseText(capsule.trigger, 300)
+		&& conciseText(capsule.readFullWhen, 300) && completeRules(capsule.essentialRules, 300);
+}
+
+function isToolCapsule(value: unknown): value is ToolGuidelineCapsule {
+	if (!value || typeof value !== "object") return false;
+	const capsule = value as ToolGuidelineCapsule;
+	return typeof capsule.name === "string" && typeof capsule.source === "string"
+		&& typeof capsule.fingerprint === "string" && typeof capsule.reason === "string"
+		&& (capsule.mode === "full" || (capsule.mode === "capsule"
+			&& completeRules(capsule.essentialRules, 320) && capsule.essentialRules.length > 0));
 }
 
 export async function routeCapabilities(
@@ -336,11 +360,13 @@ export async function routeCapabilities(
 	cache: SkillCapsuleCache,
 	context: IncrementalRouteContext = {},
 ): Promise<PromptRoute | undefined> {
-	const toolCatalog = tools.map((tool) => ({
+	const activeTools = new Set(context.activeTools ?? []);
+	const activeSkills = new Set(context.activeSkills ?? []);
+	const inactiveTools = tools.filter((tool) => !activeTools.has(tool.name)).map((tool) => ({
 		name: tool.name,
 		description: compactCatalogDescription(tool.description, 220),
 	}));
-	const skillCatalog = skills.map((skill) => {
+	const inactiveSkills = skills.filter((skill) => !activeSkills.has(skill.name)).map((skill) => {
 		const capsule = getValidSkillCapsule(cache, skill);
 		return {
 			name: skill.name,
@@ -349,19 +375,20 @@ export async function routeCapabilities(
 				: compactCatalogDescription(skill.description, 500),
 		};
 	});
-	const activeTools = new Set(context.activeTools ?? []);
-	const activeSkills = new Set(context.activeSkills ?? []);
-	const inactiveTools = toolCatalog.filter((tool) => !activeTools.has(tool.name));
-	const inactiveSkills = skillCatalog.filter((skill) => !activeSkills.has(skill.name));
+	if (inactiveTools.length === 0 && inactiveSkills.length === 0) return { tools: [], skills: [] };
+	const pendingTask = context.pendingTask?.trim() || undefined;
+	const intentSummary = context.intentSummary?.trim() || undefined;
+	const recentUserRequests = [...new Set((context.recentUserRequests ?? []).map((request) => request.trim()).filter(Boolean))]
+		.filter((request) => request !== pendingTask && request !== intentSummary);
 	const result = await completeJson(
 		ctx,
 		config,
 		ROUTER_SYSTEM_PROMPT,
 		JSON.stringify({
 			userRequest: userPrompt,
-			recentUserRequests: context.recentUserRequests ?? [],
-			pendingTask: context.pendingTask,
-			intentSummary: context.intentSummary,
+			recentUserRequests,
+			pendingTask,
+			intentSummary: intentSummary === pendingTask ? undefined : intentSummary,
 			activeTools: [...activeTools],
 			activeSkills: [...activeSkills],
 			registryAdded: context.registryAdded ?? [],
@@ -378,7 +405,7 @@ export async function routeCapabilities(
 
 	const availableTools = new Set(tools.map((tool) => tool.name));
 	const availableSkills = new Set(skills.map((skill) => skill.name));
-	const selectedSkills = requestedSkills
+	const selectedSkills = [...new Set(requestedSkills)]
 		.filter((name) => availableSkills.has(name) && !activeSkills.has(name))
 		.slice(0, config.maxSkills ?? 8);
 	const selectedTools = requestedTools.filter((name) => availableTools.has(name) && !activeTools.has(name));
@@ -425,12 +452,16 @@ export async function distillToolGuidelines(
 		generatedAt: new Date().toISOString(),
 	};
 	if (result.mode === "full") return { ...common, mode: "full" };
-	const essentialRules = strictStringArray(result.essentialRules);
-	if (!essentialRules || essentialRules.length === 0) return undefined;
+	const essentialRules = result.essentialRules;
+	// Reject an unsafe summary rather than cutting off constraints or dropping rules.
+	if (!completeRules(essentialRules, 320) || essentialRules.length === 0
+		|| essentialRules.join("\n").length >= guidelines.join("\n").length) {
+		return { ...common, mode: "full", reason: "Capsule is invalid, exceeds the rule budget, or is not shorter than the original." };
+	}
 	return {
 		...common,
 		mode: "capsule",
-		essentialRules: essentialRules.slice(0, 4).map((rule) => compactCatalogDescription(rule, 320)),
+		essentialRules,
 	};
 }
 
@@ -454,15 +485,15 @@ export async function distillSkill(
 		`Skill name: ${skill.name}\nSkill path: ${skill.filePath}\n\n<skill>\n${content}\n</skill>`,
 		1200,
 	);
-	if (!result || typeof result.trigger !== "string" || typeof result.readFullWhen !== "string") return undefined;
-	const essentialRules = stringArray(result.essentialRules).slice(0, 4);
+	if (!result || !conciseText(result.trigger, 300) || !conciseText(result.readFullWhen, 300)
+		|| !completeRules(result.essentialRules, 300)) return undefined;
 	return {
 		name: skill.name,
 		filePath: skill.filePath,
 		fingerprint,
-		trigger: compactCatalogDescription(result.trigger, 300),
-		essentialRules: essentialRules.map((rule) => compactCatalogDescription(rule, 300)),
-		readFullWhen: compactCatalogDescription(result.readFullWhen, 300),
+		trigger: result.trigger,
+		essentialRules: result.essentialRules,
+		readFullWhen: result.readFullWhen,
 		generatedAt: new Date().toISOString(),
 	};
 }

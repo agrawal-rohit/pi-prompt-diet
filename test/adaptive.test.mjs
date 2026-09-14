@@ -9,12 +9,17 @@ process.env.HOME = testHome;
 
 const { default: promptDiet } = await import("../index.ts");
 const {
+	distillSkill,
+	distillToolGuidelines,
+	fingerprintSkill,
 	fingerprintToolGuidelines,
+	getValidSkillCapsule,
 	getValidToolGuidelineCapsule,
 	loadSkillCapsuleCache,
 	loadToolGuidelineCapsuleCache,
 	saveSkillCapsuleCache,
 	saveToolGuidelineCapsule,
+	routeCapabilities,
 } = await import("../adaptive.ts");
 
 const tools = [
@@ -309,6 +314,196 @@ test("stale cache snapshots cannot overwrite unrelated Skill capsules", () => {
 	const merged = loadSkillCapsuleCache();
 	assert.ok(merged.skills["/skill/one"]);
 	assert.ok(merged.skills["/skill/two"]);
+});
+
+test("explicit skill expansion is excluded from router intent and continuation state", async () => {
+	let routerPayload;
+	let routerSystemPrompt;
+	const harness = createHarness(async (_model, request) => {
+		if (request.systemPrompt.includes("incremental capability router")) {
+			routerSystemPrompt = request.systemPrompt;
+			routerPayload = JSON.parse(request.messages[0].content[0].text);
+		}
+		return { stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":[]}' }] };
+	});
+	const hiddenSkill = {
+		name: "multi-model-orchestrator",
+		description: "Explicit-only orchestrator.",
+		filePath: join(testHome, "explicit", "multi-model-orchestrator", "SKILL.md"),
+		disableModelInvocation: true,
+		sourceInfo: { source: "user" },
+	};
+	const expanded = `<skill name="multi-model-orchestrator" location="${hiddenSkill.filePath}">\nReferences are relative to ${join(testHome, "explicit", "multi-model-orchestrator")}.\n\n# Policy\nUse chatgpt and xr-local-skill for hard work.\n</skill>\n\nDo not call tools or delegate.`;
+	const event = {
+		prompt: expanded,
+		systemPrompt,
+		systemPromptOptions: { skills: [hiddenSkill], promptGuidelines: tools.flatMap((tool) => tool.promptGuidelines) },
+	};
+
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	const result = await harness.emit("before_agent_start", event, harness.ctx);
+	assert.equal(routerPayload.userRequest, "Do not call tools or delegate.");
+	assert.match(routerSystemPrompt, /Honor explicit prohibitions and hypothetical\/planning-only framing/);
+	assert.doesNotMatch(JSON.stringify(routerPayload), /Use chatgpt and xr-local-skill/);
+	assert.doesNotMatch(result.systemPrompt, /multi-model-orchestrator/);
+
+	const state = harness.entries.filter((entry) => entry.customType === "pi-prompt-diet-capabilities").at(-1).data;
+	assert.deepEqual(state.recentUserRequests, ["Do not call tools or delegate."]);
+	assert.equal(state.pendingTask, "Do not call tools or delegate.");
+	assert.equal(state.intentSummary, "Do not call tools or delegate.");
+	assert.doesNotMatch(JSON.stringify(state), /<skill name=/);
+});
+
+test("router payload deduplicates continuation state", async () => {
+	const payloads = [];
+	const harness = createHarness(async (_model, request) => {
+		if (request.systemPrompt.includes("incremental capability router")) {
+			payloads.push(JSON.parse(request.messages[0].content[0].text));
+		}
+		return { stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":[]}' }] };
+	});
+	const event = eventFor([]);
+
+	await harness.emit("session_start", { reason: "startup" }, harness.ctx);
+	await harness.emit("before_agent_start", { ...event, prompt: "Inspect the current task." }, harness.ctx);
+	await harness.emit("before_agent_start", { ...event, prompt: "Check one more detail." }, harness.ctx);
+
+	assert.equal(payloads.length, 2);
+	assert.equal(payloads[1].pendingTask, "Inspect the current task.");
+	assert.equal(payloads[1].intentSummary, undefined);
+	assert.deepEqual(payloads[1].recentUserRequests, []);
+});
+
+test("an exhausted catalog skips the router model entirely", async () => {
+	const harness = createHarness(() => { throw new Error("Must not call the model"); });
+	const route = await routeCapabilities(harness.ctx, {}, "New task", tools, [], { version: 1, skills: {} }, {
+		activeTools: tools.map((tool) => tool.name),
+	});
+	assert.deepEqual(route, { tools: [], skills: [] });
+});
+
+test("duplicate skill selections do not consume the selection budget", async () => {
+	const { skills } = createSkills("duplicate-route");
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ tools: [], skills: ["weather-helper", "weather-helper", "other"] }) }] }));
+	const route = await routeCapabilities(harness.ctx, { maxSkills: 2 }, "Help", tools, skills, { version: 1, skills: {} });
+	assert.deepEqual(route.skills, ["weather-helper", "other"]);
+	assert.deepEqual(route.tools, ["read"]);
+});
+
+test("Skill recovery exposes a usable path and read tool in the same turn", async () => {
+	const { skills, weatherPath } = createSkills("skill-recovery");
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":[]}' }] }));
+	await harness.emit("before_agent_start", eventFor(skills));
+	const result = await harness.executeTool("request_capabilities", { skills: ["weather-helper"], reason: "Need weather guidance" });
+	assert.equal(result.details.status, "activated");
+	assert.deepEqual(result.details.addedTools, ["read"]);
+	assert.ok(harness.getActiveTools().includes("read"));
+	assert.equal(result.details.skills[0].filePath, weatherPath);
+	assert.ok(result.content[0].text.includes(weatherPath));
+	assert.match(result.content[0].text, /Read the relevant SKILL.md/);
+});
+
+test("activation failures count toward the budget and a new turn resets it", async () => {
+	let rejectActivation = false;
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":[]}' }] }), () => {
+		if (rejectActivation) throw new Error("Activation unavailable");
+	});
+	await harness.emit("before_agent_start", eventFor([]));
+	rejectActivation = true;
+	for (let i = 0; i < 2; i++) {
+		const result = await harness.executeTool("request_capabilities", { tools: ["edit"], reason: "Edit" });
+		assert.equal(result.details.status, "failed");
+		assert.match(result.content[0].text, /Activation unavailable/);
+	}
+	const blocked = await harness.executeTool("request_capabilities", { tools: ["edit"], reason: "Edit again" });
+	assert.equal(blocked.details.failures[0].code, "turn_budget_exceeded");
+	rejectActivation = false;
+	await harness.emit("before_agent_start", { ...eventFor([]), prompt: "continue" });
+	const reset = await harness.executeTool("request_capabilities", { tools: ["edit"], reason: "Edit" });
+	assert.equal(reset.details.status, "activated");
+});
+
+test("Skill recovery includes read in the additions budget", async () => {
+	const { skills } = createSkills("dependency-budget");
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":[]}' }] }));
+	const project = join(testHome, "budget-project");
+	mkdirSync(join(project, ".pi"), { recursive: true });
+	writeFileSync(join(project, ".pi", "pi-prompt-diet.json"), JSON.stringify({ adaptive: { maxAdditionsPerRequest: 1 } }));
+	harness.ctx.cwd = project;
+	await harness.emit("before_agent_start", eventFor(skills));
+	const result = await harness.executeTool("request_capabilities", { skills: ["weather-helper"], reason: "Need guidance" });
+	assert.equal(result.details.failures[0].code, "too_many_additions");
+	assert.deepEqual(harness.getActiveTools(), ["request_capabilities"]);
+});
+
+test("automatic routing applies denied and explicit-only policies to Skills", async () => {
+	const { skills } = createSkills("skill-policies");
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":["weather-helper","other"]}' }] }));
+	const project = join(testHome, "policy-project");
+	mkdirSync(join(project, ".pi"), { recursive: true });
+	writeFileSync(join(project, ".pi", "pi-prompt-diet.json"), JSON.stringify({ adaptive: { neverAutoActivate: ["weather-helper"], requireExplicitUserIntent: ["other"] } }));
+	harness.ctx.cwd = project;
+	const result = await harness.emit("before_agent_start", eventFor(skills));
+	assert.doesNotMatch(result.systemPrompt, /<name>weather-helper<\/name>|<name>other<\/name>/);
+	const denied = await harness.executeTool("request_capabilities", { skills: ["weather-helper"], reason: "Weather" });
+	assert.equal(denied.details.status, "failed");
+	assert.equal(denied.details.failures[0].code, "policy_denied");
+	assert.match(denied.content[0].text, /policy_denied/);
+});
+
+test("removed Skills are no longer available to the recovery tool", async () => {
+	const { skills } = createSkills("removed-skills");
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":[]}' }] }));
+	await harness.emit("before_agent_start", eventFor(skills));
+	await harness.emit("before_agent_start", eventFor([]));
+	const result = await harness.executeTool("request_capabilities", { skills: ["weather-helper"], reason: "Weather" });
+	assert.deepEqual(result.details.unavailable, ["weather-helper"]);
+	assert.equal(result.details.status, "failed");
+});
+
+test("warm Skill capsules retain complete constraints beyond the description limit", async () => {
+	const { skills, weatherPath } = createSkills("complete-capsule");
+	const rule = `Before publishing a forecast, ${"verify the source and timestamp; ".repeat(6)}never fabricate missing readings.`;
+	const cache = loadSkillCapsuleCache();
+	cache.skills[weatherPath] = {
+		name: "weather-helper", filePath: weatherPath, fingerprint: fingerprintSkill(weatherPath),
+		trigger: "Use for current weather.", essentialRules: [rule], readFullWhen: "using provider-specific workflows.", generatedAt: "now",
+	};
+	saveSkillCapsuleCache(cache);
+	const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"tools":[],"skills":["weather-helper"]}' }] }));
+	const result = await harness.emit("before_agent_start", eventFor(skills));
+	assert.ok(result.systemPrompt.includes(rule));
+	assert.match(result.systemPrompt, /never fabricate missing readings/);
+});
+
+test("unsafe or non-saving tool distillations keep the full original guidelines", async () => {
+	const tool = { ...tools[1], promptGuidelines: ["Never publish unverified data."] };
+	for (const essentialRules of [["x".repeat(321)], ["one", "two", "three", "four", "Never publish"], [""], [null], ["A longer summary that provides no character savings over the original rule."]]) {
+		const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ mode: "capsule", essentialRules, reason: "Shorten" }) }] }));
+		assert.equal((await distillToolGuidelines(harness.ctx, {}, tool)).mode, "full");
+	}
+});
+
+test("invalid Skill distillations fall back instead of truncating operational rules", async () => {
+	const { skills } = createSkills("invalid-distillation");
+	for (const essentialRules of [["x".repeat(301)], ["one", "two", "three", "four", "Never publish"], [""], [null], undefined]) {
+		const harness = createHarness(async () => ({ stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ trigger: "Weather", essentialRules, readFullWhen: "Needed" }) }] }));
+		assert.equal(await distillSkill(harness.ctx, {}, skills[0]), undefined);
+	}
+});
+
+test("malformed disk caches are ignored even when their fingerprints match", () => {
+	const { skills, weatherPath } = createSkills("invalid-cache");
+	const skillCache = { version: 1, skills: { [weatherPath]: { name: "weather-helper", filePath: weatherPath, fingerprint: fingerprintSkill(weatherPath) } } };
+	const tool = tools[1];
+	const key = "npm:web:web_search";
+	const toolCache = { version: 1, tools: { [key]: { name: tool.name, source: "npm:web", fingerprint: fingerprintToolGuidelines(tool), mode: "capsule", reason: "Missing rules" } } };
+	saveSkillCapsuleCache(skillCache);
+	saveToolGuidelineCapsule(toolCache, key);
+	assert.equal(getValidSkillCapsule(skillCache, skills[0]), undefined);
+	assert.equal(getValidToolGuidelineCapsule(toolCache, tool), undefined);
+	assert.equal(loadSkillCapsuleCache().skills[weatherPath], undefined);
+	assert.equal(loadToolGuidelineCapsuleCache().tools[key], undefined);
 });
 
 test.after(() => rmSync(testHome, { recursive: true, force: true }));

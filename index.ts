@@ -305,15 +305,14 @@ function selectedCoreGuidelines(customCore: string[] | undefined, selectedTools?
 	});
 }
 
+function cleanDescription(description: string): string {
+	return description.trim().replace(/\s+/g, " ");
+}
+
 function shortToolDescription(description: string): string {
-	const clean = description.trim().replace(/\s+/g, " ");
-	if (clean.length <= 350) return clean;
-	const slice = clean.slice(0, 350);
-	const lastDot = slice.lastIndexOf(". ");
-	if (lastDot > 150) return slice.slice(0, lastDot + 1);
-	const lastSpace = slice.lastIndexOf(" ");
-	const boundary = lastSpace > 250 ? lastSpace : slice.length - 3;
-	return `${slice.slice(0, boundary).trimEnd()}...`;
+	const clean = cleanDescription(description);
+	if (clean.length <= 180) return clean;
+	return `${clean.slice(0, 177).trimEnd()}...`;
 }
 
 function truncateDescription(description: string, maxLength: number): string {
@@ -332,7 +331,7 @@ function rewriteAvailableTools(prompt: string, selectedTools: Set<string>, allTo
 	if (end === -1) return prompt;
 	const lines = allTools
 		.filter((tool) => selectedTools.has(tool.name))
-		.map((tool) => `- ${tool.name}: ${shortToolDescription(tool.description)}`);
+		.map((tool) => `- ${tool.name}: ${cleanDescription(tool.description)}`);
 	const section = lines.length > 0 ? `Available tools:\n${lines.join("\n")}` : "";
 	return prompt.slice(0, start) + section + prompt.slice(end);
 }
